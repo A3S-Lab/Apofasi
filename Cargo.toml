@@ -1,0 +1,18 @@
+[package]
+name = "a3s-apofasi"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "MIT"
+authors = ["A3S Lab"]
+repository = "https://github.com/A3S-Lab/Apofasi"
+homepage = "https://github.com/A3S-Lab/Apofasi"
+documentation = "https://docs.rs/a3s-apofasi"
+readme = "README.md"
+description = "Typed System-1 decision engine for A3S hosts"
+keywords = ["a3s", "decision", "routing", "calibration", "system-one"]
+categories = ["science", "algorithms"]
+
+[dependencies]
+
+[dev-dependencies]
