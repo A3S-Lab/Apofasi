@@ -62,7 +62,7 @@ Public JSON matches TypeSafe System One / Jev:
 
 ```json
 {
-  "model": "apofasi-0.1.0",
+  "model": "apofasi-0.1.1",
   "state": "string | object | array",
   "questions": {
     "<id>": {
@@ -84,7 +84,7 @@ Public JSON matches TypeSafe System One / Jev:
 
 ```json
 {
-  "model": "apofasi-0.1.0",
+  "model": "apofasi-0.1.1",
   "answers": { "<id>": { "type": "...", "...": "..." } },
   "usage": { "input_tokens": 0, "output_tokens": 0 }
 }
@@ -107,9 +107,10 @@ for Noul, the `noul` probability itself is the signal (near 0 or 1 = confident).
 - Head budget: `head_max_len` (options + instructions).
 - State budget: `max_len - head_len - 1`.
 - Markers: absolute token indices of each `[MASK]`.
-- High-cardinality choices: raise `head_max_len` / `max_len`, or hierarchical
-  coarse→fine questions — a fixed head budget cannot give dozens of labels
-  enough distinct tokens.
+- High-cardinality choices that do not fit in `head_max_len` are split into
+  groups that do. Each group is one forward with the full option text, then
+  the group winners are compared the same way. A choice that already fits is
+  still one forward.
 
 ### Network
 
@@ -270,8 +271,8 @@ Wire events (when emitted): `apofasi.decision.completed`,
 | CPU | ≤ 500 ms p50 | f32 fallback |
 
 Batching N questions in one forward pass is mandatory for the hot path.
-The 0.1.0 Apple Silicon measurements (resident router, warmup 12, 40 samples,
-p50) are in the README, next to the published hosted Jev latency band.
+The 0.1.1 Apple Silicon measurements are in the README, next to the published
+hosted Jev accuracy and latency.
 
 ## Roadmap (architecture milestones)
 

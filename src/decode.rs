@@ -108,6 +108,34 @@ fn round4(v: f32) -> f32 {
     (v * 10_000.0).round() / 10_000.0
 }
 
+pub(crate) fn choice_from_probs(option_labels: &[String], probs: &[f32]) -> Result<Answer> {
+    if option_labels.len() != probs.len() || option_labels.is_empty() {
+        return Err(Error::InvalidQuestion {
+            id: String::new(),
+            reason: format!(
+                "probability/label length mismatch ({} vs {})",
+                option_labels.len(),
+                probs.len()
+            ),
+        });
+    }
+    let mut probabilities = BTreeMap::new();
+    let mut best_i = 0usize;
+    let mut best_p = f32::NEG_INFINITY;
+    for (i, (label, p)) in option_labels.iter().zip(probs.iter()).enumerate() {
+        probabilities.insert(label.clone(), round4(*p));
+        if *p > best_p {
+            best_p = *p;
+            best_i = i;
+        }
+    }
+    Ok(Answer::Choice {
+        choice: option_labels[best_i].clone(),
+        confidence: round4(confidence_from_probs(probs)),
+        probabilities,
+    })
+}
+
 /// Render score legend entry text (for tests / debugging).
 pub fn score_legend_text(value: &Value) -> String {
     criterion_text(value)

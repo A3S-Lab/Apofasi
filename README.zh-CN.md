@@ -56,16 +56,23 @@ cargo build --release
 cargo build --release --features cli,metal,mlx --bin a3s-apofasi
 ```
 
-## 相对 Jev 的延迟
+## 相对 Jev
 
-Apofasi 0.1.0 在 Apple Silicon 上用 MLX 前向路径测量。检查点保持常驻。每个用例先预热 12 次，再计时 40 次。数字是 p50（上中位数：排序后取 `sorted[len/2]`）。
+Apofasi 0.1.1 在 Apple Silicon 上用 MLX 前向路径测量。Jev **没有**在这台机器上运行。下面的 Jev 数字是已发布的托管 API 结果，包含网络往返。Apofasi 的数字是设备上预热后的时间。速度列是本地时间相对已发布 Jev p50 快了多少倍，不是同一台机器上的配对重测。
 
-Jev **没有**在这台机器上运行。下面的区间是公开的托管 API 上、一次类型化决策的 p50：
+准确率来自未修改的 [jev-benchmarks](https://github.com/AbdelStark/jev-benchmarks) `pilot-v1` 清单：AG News、Banking77、DAIR Emotion 各 100 条，没有失败。没有改该仓库，也没有改它的配置。Apofasi 使用的问题文本和 `label_000`… 选项键与该包里 Jev 适配器相同。概率由它的 `group_scores` 计分（ECE 10 箱，5% 错误预算）。检查点权重没有改。
 
-- [jev-benchmarks](https://github.com/AbdelStark/jev-benchmarks)：Jev 1.13.0 在 4 标签和 6 标签任务上的 p50 为 236–256 ms，72 标签为 246 ms。延迟包含基准客户端到服务的网络往返。
-- [decision-model-benchmark](https://github.com/nibzard/decision-model-benchmark)：Jev 的 p50 为 264–276 ms，从 2 个选项到 255 个选项基本持平。
+| 数据集 | Apofasi 准确率 | Jev 准确率 | Apofasi p50 | Jev p50 | 速度 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| AG News | 0.960 | 0.910 | 9.8 ms | 255.9 ms | 26.1× |
+| DAIR Emotion | 0.420 | 0.480 | 13.1 ms | 236.3 ms | 18.0× |
+| Banking77 | 0.560 | 0.870 | 76.1 ms | 246.4 ms | 3.2× |
 
-合在一起，公开的 Jev 单题 p50 是 **236–276 ms**。Apofasi 的数字是设备上的前向时间。倍数表示本地调用少花了多少时间，不是把那两份研究的题目再跑一遍。
+AG News 准确率更高，并且快 26.1 倍。Brier 是 0.098，对 Jev 的 0.146；ECE 是 0.137，对 Jev 的 0.064。DAIR Emotion 准确率低 0.060（Brier 0.976 对 0.846，ECE 0.404 对 0.351），快 18.0 倍。它只有 6 个标签，一次前向就放得下。Banking77 有 72 个标签。一次前向会把每个选项切成同一个 token 前缀（准确率 0.020，62% 的样本把真实标签的概率打成 0）。放不进 `head_max_len` 的选择题现在会拆成若干放得进的组，再比较各组的胜出项。准确率 0.560，Brier 0.599，ECE 0.134，真实标签概率为 0 的比例是 0。这仍比已发布的 Jev 低 0.310，也略低于已发布的 GLiNER2.5（准确率 0.610，p50 295.5 ms）。多次前向使这一行是 3.2 倍，而不是单次前向的倍数。已发布的 GLiNER2.5 在另外两组上的准确率 / p50：AG News 0.700 / 44.9 ms，DAIR Emotion 0.440 / 43.3 ms。
+
+这份试点之外，已发布的 Jev 延迟在 jev-benchmarks 的 4 标签和 6 标签任务上是 236–256 ms p50，在 [decision-model-benchmark](https://github.com/nibzard/decision-model-benchmark) 上是 264–276 ms p50。合在一起，公开的 Jev 单题是 **236–276 ms**。
+
+下面七个用例是另一套本地测量。每个用例先预热 12 次，再计时 40 次。数字是 p50（上中位数：排序后取 `sorted[len/2]`）。它们没有可并排的已发布 Jev 准确率。七个用例都通过了记录这些样本时使用的答案检查。只有前两行和 Jev 公开数据里的「一次决策」形状相同。
 
 | 用例 | 问题数 | Apofasi p50 | 相对 236–276 ms |
 | --- | ---: | ---: | --- |
@@ -76,10 +83,6 @@ Jev **没有**在这台机器上运行。下面的区间是公开的托管 API �
 | 中文账单分诊 | 4 | 5.04 ms | 46.8×–54.8× |
 | 防护预设 | 5 | 12.76 ms | 18.5×–21.6× |
 | 显式指定检查点 | 4 | 12.82 ms | 18.4×–21.5× |
-
-只有前两行和 Jev 公开数据里的「一次决策」形状相同。其余行一次调用里的问题更多，总耗时仍然低于那个单题区间。七个用例都通过了记录这些样本时使用的同一套答案检查。
-
-这张表不是准确率对比。Jev 公开的标签准确率（jev-benchmarks 中 AG News 0.910、Banking77 0.870、DAIR Emotion 0.480）是在那些数据集上测的。Apofasi 0.1.0 没有在上面重测。
 
 ## 检查点
 
@@ -100,7 +103,7 @@ checkpoint/
 | 项 | 值 |
 | --- | --- |
 | 包名 | `a3s-apofasi` |
-| 版本 | 0.1.0 |
+| 版本 | 0.1.1 |
 | 仓库 | [A3S-Lab/Apofasi](https://github.com/A3S-Lab/Apofasi) |
 | 许可证 | MIT |
 

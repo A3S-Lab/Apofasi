@@ -163,11 +163,14 @@ fn compact_answers(answers: &indexmap::IndexMap<String, Answer>) -> Value {
     for (id, answer) in answers {
         let slim = match answer {
             Answer::Choice {
-                choice, confidence, ..
+                choice,
+                confidence,
+                probabilities,
             } => json!({
                 "type": "choice",
                 "choice": choice,
                 "confidence": confidence,
+                "probabilities": probabilities,
             }),
             Answer::Score {
                 score, confidence, ..

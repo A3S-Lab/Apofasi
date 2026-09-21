@@ -66,24 +66,52 @@ cargo build --release
 cargo build --release --features cli,metal,mlx --bin a3s-apofasi
 ```
 
-## Latency versus Jev
+## Versus Jev
 
-Apofasi 0.1.0 was measured on Apple Silicon with the MLX forward path.
-Checkpoints stayed loaded. Each case was warmed 12 times, then timed for
-40 calls. The figure is the p50 (upper median: `sorted[len/2]`).
+Apofasi 0.1.1 was measured on Apple Silicon with the MLX forward path.
+Jev was **not** run on this machine. Jev figures below are the published
+hosted-API numbers, and they include the network hop. Apofasi figures are
+warm on-device time. The speed column is how many times faster that local
+time is than the published Jev p50. It is not a paired replay on one machine.
 
-Jev was **not** run on this machine. The band below is the published
-hosted-API p50 for one typed decision:
+The accuracy rows are the unmodified
+[jev-benchmarks](https://github.com/AbdelStark/jev-benchmarks) `pilot-v1`
+manifest: 100 examples each of AG News, Banking77, and DAIR Emotion, zero
+failures. The benchmark repository and its config were not edited. Apofasi
+saw the same question text and the same `label_000`… option keys as that
+package's Jev adapter. Probabilities were scored by its `group_scores`
+(10 ECE bins, 5% error budget). Checkpoint weights were not changed.
 
-- [jev-benchmarks](https://github.com/AbdelStark/jev-benchmarks): Jev 1.13.0,
-  236–256 ms p50 on 4- and 6-label tasks, 246 ms p50 at 72 labels.
-  Latency includes the network hop from the benchmark client.
-- [decision-model-benchmark](https://github.com/nibzard/decision-model-benchmark):
-  Jev p50 264–276 ms, flat from 2 to 255 options.
+| Dataset | Apofasi accuracy | Jev accuracy | Apofasi p50 | Jev p50 | Speed |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| AG News | 0.960 | 0.910 | 9.8 ms | 255.9 ms | 26.1× |
+| DAIR Emotion | 0.420 | 0.480 | 13.1 ms | 236.3 ms | 18.0× |
+| Banking77 | 0.560 | 0.870 | 76.1 ms | 246.4 ms | 3.2× |
 
-Taken together, published Jev p50 for one question is **236–276 ms**.
-Apofasi's numbers are on-device forward time. The ratio is how much less
-time the local call took, not a paired replay of those studies.
+AG News is ahead on accuracy and 26.1× faster. Its Brier is 0.098 against
+Jev's 0.146; its ECE is 0.137 against Jev's 0.064. DAIR Emotion is 0.060
+behind on accuracy (Brier 0.976 vs 0.846, ECE 0.404 vs 0.351) and 18.0×
+faster. Its six labels already fit in one forward. Banking77 has 72 labels.
+One forward used to cut every option down to the same token prefix
+(accuracy 0.020, true-label probability 0 on 62% of examples). Choices that
+do not fit `head_max_len` are now split into groups that do, then the group
+winners are compared. Accuracy is 0.560, Brier 0.599, ECE 0.134, and no true
+label is given probability 0. That is still 0.310 behind published Jev, and
+just behind published GLiNER2.5 (0.610 accuracy, 295.5 ms p50). The extra
+forwards make this row 3.2× rather than a single-pass ratio. Published
+GLiNER2.5 accuracy / p50 on the other two sets: AG News 0.700 / 44.9 ms,
+DAIR Emotion 0.440 / 43.3 ms.
+
+Published Jev latency outside this pilot is 236–256 ms p50 on 4- and 6-label
+tasks in jev-benchmarks, and 264–276 ms p50 in
+[decision-model-benchmark](https://github.com/nibzard/decision-model-benchmark).
+Taken together, one published Jev question is **236–276 ms**.
+
+The seven cases below are a separate local suite. Each was warmed 12 times,
+then timed for 40 calls. The figure is the p50 (upper median:
+`sorted[len/2]`). They have no published Jev accuracy to put beside them.
+All seven passed the answer checks used while recording the samples. Only
+the two 1-question rows match Jev's published "one decision" shape.
 
 | Case | Questions | Apofasi p50 | Versus 236–276 ms |
 | --- | ---: | ---: | --- |
@@ -94,14 +122,6 @@ time the local call took, not a paired replay of those studies.
 | Chinese billing triage | 4 | 5.04 ms | 46.8×–54.8× |
 | Guard preset | 5 | 12.76 ms | 18.5×–21.6× |
 | Explicit typed checkpoint | 4 | 12.82 ms | 18.4×–21.5× |
-
-Only the two 1-question rows match Jev's published "one decision" shape.
-The other rows finish a heavier call still under that 1-question band.
-All seven cases passed the same answer checks used to record the samples.
-
-This table is not an accuracy comparison. Jev's published label accuracy
-(AG News 0.910, Banking77 0.870, DAIR Emotion 0.480 in jev-benchmarks)
-was measured on those datasets. Apofasi 0.1.0 was not scored on them.
 
 ## Checkpoint
 
@@ -124,7 +144,7 @@ See [`docs/publish-layout.md`](docs/publish-layout.md).
 | Item | Value |
 | --- | --- |
 | Package | `a3s-apofasi` |
-| Version | 0.1.0 |
+| Version | 0.1.1 |
 | Repository | [A3S-Lab/Apofasi](https://github.com/A3S-Lab/Apofasi) |
 | License | MIT |
 

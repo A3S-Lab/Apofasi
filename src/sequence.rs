@@ -29,6 +29,9 @@ pub trait Tokenize {
     fn encode_ordinary(&self, text: &str) -> Result<Vec<u32>>;
 }
 
+/// Tokens reserved for the instruction line before option bodies are shortened.
+pub const HEAD_INSTRUCTION_RESERVE: usize = 16;
+
 /// Packing configuration (mirrors checkpoint `max_len` / `head_max_len`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SequenceConfig {
@@ -181,11 +184,19 @@ pub fn pack_question<T: Tokenize>(
     let mut opt_budget = cfg
         .head_max_len
         .saturating_sub(opt_ids.iter().map(|o| o.len()).sum());
-    if opt_budget < 16 {
-        let per = ((cfg.head_max_len.saturating_sub(16)) / opt_ids.len().max(1)).max(4);
+    if opt_budget < HEAD_INSTRUCTION_RESERVE {
+        let per = ((cfg.head_max_len.saturating_sub(HEAD_INSTRUCTION_RESERVE))
+            / opt_ids.len().max(1))
+        .max(4);
         for o in &mut opt_ids {
             if o.len() > per {
-                o.truncate(per);
+                // The mask stays; the body keeps its tail. Shared boilerplate
+                // sits at the front, and the front is what a hard cut used to keep.
+                let keep_body = per.saturating_sub(1);
+                let start = o.len().saturating_sub(keep_body);
+                let tail: Vec<u32> = o[start..].to_vec();
+                o.truncate(1);
+                o.extend(tail);
             }
         }
         opt_budget = cfg
@@ -242,6 +253,38 @@ pub fn pack_question<T: Tokenize>(
         qtype: question.type_.type_id(),
         option_labels,
     })
+}
+
+/// Token cost of each choice option, including its `[MASK]` marker.
+///
+/// `None` when the question is not a choice. Costs match [`pack_question`]
+/// before any head-budget shortening.
+pub fn choice_option_costs<T: Tokenize>(
+    tok: &T,
+    mask_token_str: &str,
+    question: &Question,
+    option_cap: usize,
+) -> Result<Option<Vec<usize>>> {
+    if question.type_ != DecisionKind::Choice {
+        return Ok(None);
+    }
+    let rendered = render_options(question).map_err(|err| match err {
+        Error::InvalidQuestion { reason, .. } => Error::InvalidQuestion {
+            id: String::new(),
+            reason,
+        },
+        other => other,
+    })?;
+    let mut costs = Vec::with_capacity(rendered.len());
+    for (_, text) in &rendered {
+        let cleaned = text.replace(mask_token_str, " ");
+        let mut body = tok.encode_ordinary(&format!(" {cleaned}"))?;
+        if body.len() > option_cap {
+            body.truncate(option_cap);
+        }
+        costs.push(1 + body.len());
+    }
+    Ok(Some(costs))
 }
 
 /// Whitespace / char-level stub tokenizer for unit tests (not for production).
@@ -319,5 +362,49 @@ mod tests {
         let opts = render_options(&q).unwrap();
         assert_eq!(opts[0].1, "level 0: low");
         assert_eq!(opts[1].1, "level 1: high");
+    }
+
+    #[test]
+    fn overflow_keeps_option_tails() {
+        let mut opts = IndexMap::new();
+        for i in 0..8 {
+            opts.insert(
+                format!("k{i}"),
+                Some(json!(format!("shared shared shared tail{i}"))),
+            );
+        }
+        let q = Question::new(
+            DecisionKind::Choice,
+            json!("Which?"),
+            Some(Criteria::Choice(opts)),
+        )
+        .unwrap();
+        let packed = pack_question(
+            &ByteTokenizer,
+            specials(),
+            "[MASK]",
+            &State::Text("x".into()),
+            "q",
+            &q,
+            SequenceConfig {
+                max_len: 512,
+                head_max_len: 48,
+                option_cap: 48,
+            },
+        )
+        .unwrap();
+        let digit = |n: u32| u32::from(char::from_digit(n, 10).unwrap()) % 50_000 + 16;
+        for (i, &marker) in packed.markers.iter().enumerate() {
+            let next = packed
+                .markers
+                .get(i + 1)
+                .copied()
+                .unwrap_or(packed.input_ids.len());
+            let body = &packed.input_ids[marker + 1..next];
+            assert!(
+                body.contains(&digit(i as u32)),
+                "option {i} lost its distinctive tail"
+            );
+        }
     }
 }

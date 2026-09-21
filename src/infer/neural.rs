@@ -12,11 +12,13 @@ use super::device::{resolve_device, DeviceRequest};
 #[cfg(feature = "mlx")]
 use super::mlx_decision::MlxDecision;
 use super::tokenizer::HfTokenizer;
-use crate::decode::answer_from_logits;
+use crate::decode::{answer_from_logits, choice_from_probs, softmax};
 use crate::engine::DecisionEngine;
 use crate::error::{Error, Result};
-use crate::schema::{SystemOneRequest, SystemOneResponse, TokenUsage};
-use crate::sequence::pack_question;
+use crate::primitive::DecisionKind;
+use crate::schema::{Criteria, Question, State, SystemOneRequest, SystemOneResponse, TokenUsage};
+use crate::sequence::{choice_option_costs, pack_question, PackedQuestion};
+use crate::wide_choice::{compose_grouped_probs, plan_choice_groups};
 
 enum EngineNet {
     Candle(DecisionNet),
@@ -99,6 +101,169 @@ impl NeuralEngine {
             escalate: e1 / sum,
         })
     }
+
+    fn forward_packed(
+        &self,
+        packed: &[PackedQuestion],
+    ) -> Result<Vec<super::decision_net::ForwardOutput>> {
+        if packed.is_empty() {
+            return Ok(Vec::new());
+        }
+        let items: Vec<BatchItem<'_>> = packed
+            .iter()
+            .map(|one| BatchItem {
+                input_ids: &one.input_ids,
+                markers: &one.markers,
+                qtype: one.qtype,
+            })
+            .collect();
+        match &self.net {
+            EngineNet::Candle(net) => net.forward_batch(&items, self.tokenizer.specials.pad, false),
+            #[cfg(feature = "mlx")]
+            EngineNet::Mlx(net) => net.forward_batch(&items, self.tokenizer.specials.pad, false),
+        }
+    }
+
+    fn question_is_wide(&self, question: &Question) -> Result<bool> {
+        let Some(costs) = choice_option_costs(
+            &self.tokenizer,
+            &self.tokenizer.mask_token,
+            question,
+            self.config.sequence.option_cap,
+        )?
+        else {
+            return Ok(false);
+        };
+        Ok(plan_choice_groups(&costs, self.config.sequence.head_max_len).len() > 1)
+    }
+
+    fn direct_distribution(
+        &self,
+        state: &State,
+        question_id: &str,
+        question: &Question,
+    ) -> Result<(Vec<String>, Vec<f32>, u32)> {
+        let packed = pack_question(
+            &self.tokenizer,
+            self.tokenizer.specials,
+            &self.tokenizer.mask_token,
+            state,
+            question_id,
+            question,
+            self.config.sequence,
+        )?;
+        let tokens = packed.input_ids.len() as u32;
+        let labels = packed.option_labels.clone();
+        let outputs = self.forward_packed(std::slice::from_ref(&packed))?;
+        let logits = &outputs
+            .first()
+            .ok_or_else(|| Error::Infer("empty forward".into()))?
+            .logits;
+        let temp = self
+            .config
+            .temperatures
+            .resolve(question.type_, labels.len());
+        Ok((labels, softmax(logits, temp), tokens))
+    }
+
+    fn choice_distribution(
+        &self,
+        state: &State,
+        question_id: &str,
+        question: &Question,
+        depth: usize,
+    ) -> Result<(Vec<String>, Vec<f32>, u32)> {
+        let labels = match &question.criteria {
+            Some(Criteria::Choice(opts)) => opts.keys().cloned().collect::<Vec<_>>(),
+            _ => {
+                return Err(Error::InvalidQuestion {
+                    id: question_id.to_string(),
+                    reason: "wide choice requires choice criteria".into(),
+                });
+            }
+        };
+        let costs = choice_option_costs(
+            &self.tokenizer,
+            &self.tokenizer.mask_token,
+            question,
+            self.config.sequence.option_cap,
+        )?
+        .ok_or_else(|| Error::InvalidQuestion {
+            id: question_id.to_string(),
+            reason: "wide choice requires choice criteria".into(),
+        })?;
+        let groups = plan_choice_groups(&costs, self.config.sequence.head_max_len);
+        let splittable = groups.len() > 1 && groups.iter().any(|group| group.len() > 1);
+        if depth > 8 || !splittable {
+            return self.direct_distribution(state, question_id, question);
+        }
+
+        let mut jobs: Vec<Option<PackedQuestion>> = Vec::with_capacity(groups.len());
+        let mut tokens = 0u32;
+        for group in &groups {
+            if group.len() < 2 {
+                jobs.push(None);
+                continue;
+            }
+            let subset = subset_choice(question, group)?;
+            let packed = pack_question(
+                &self.tokenizer,
+                self.tokenizer.specials,
+                &self.tokenizer.mask_token,
+                state,
+                question_id,
+                &subset,
+                self.config.sequence,
+            )?;
+            tokens = tokens.saturating_add(packed.input_ids.len() as u32);
+            jobs.push(Some(packed));
+        }
+        let packed_jobs: Vec<PackedQuestion> = jobs.iter().filter_map(|job| job.clone()).collect();
+        let outputs = self.forward_packed(&packed_jobs)?;
+        let mut output_at = 0usize;
+        let mut chunk_probs = Vec::with_capacity(groups.len());
+        let mut winner_keys = Vec::with_capacity(groups.len());
+        for (group, job) in groups.iter().zip(&jobs) {
+            let probs = if job.is_none() {
+                vec![1.0]
+            } else {
+                let logits = &outputs[output_at].logits;
+                output_at += 1;
+                if logits.len() != group.len() {
+                    return Err(Error::Infer(format!(
+                        "question `{question_id}` group returned {} logits for {} options",
+                        logits.len(),
+                        group.len()
+                    )));
+                }
+                let temp = self
+                    .config
+                    .temperatures
+                    .resolve(DecisionKind::Choice, logits.len());
+                softmax(logits, temp)
+            };
+            let win = probs
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.total_cmp(b.1))
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+            winner_keys.push(labels[group[win]].clone());
+            chunk_probs.push(probs);
+        }
+
+        let winner_probs = if winner_keys.len() == 1 {
+            vec![1.0]
+        } else {
+            let winners = subset_choice_keys(question, &winner_keys)?;
+            let (_labels, probs, winner_tokens) =
+                self.choice_distribution(state, question_id, &winners, depth + 1)?;
+            tokens = tokens.saturating_add(winner_tokens);
+            probs
+        };
+        let composed = compose_grouped_probs(labels.len(), &groups, &chunk_probs, &winner_probs);
+        Ok((labels, composed, tokens))
+    }
 }
 
 impl DecisionEngine for NeuralEngine {
@@ -107,6 +272,9 @@ impl DecisionEngine for NeuralEngine {
     }
 
     fn decide(&self, request: &SystemOneRequest) -> Result<SystemOneResponse> {
+        if request_has_wide(self, request)? {
+            return self.decide_wide(request);
+        }
         let profile = std::env::var_os("APOFASI_PROFILE").is_some();
         let t_pack0 = std::time::Instant::now();
         let mut packed = Vec::with_capacity(request.questions.len());
@@ -189,6 +357,141 @@ impl DecisionEngine for NeuralEngine {
                 output_tokens: (request.questions.len() as u32).saturating_mul(8),
             },
         })
+    }
+}
+
+fn request_has_wide(engine: &NeuralEngine, request: &SystemOneRequest) -> Result<bool> {
+    for (id, question) in &request.questions {
+        question.validate().map_err(|err| match err {
+            Error::InvalidQuestion { reason, .. } => Error::InvalidQuestion {
+                id: id.clone(),
+                reason,
+            },
+            other => other,
+        })?;
+        if engine.question_is_wide(question)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn subset_choice(question: &Question, indices: &[usize]) -> Result<Question> {
+    let Some(Criteria::Choice(opts)) = &question.criteria else {
+        return Err(Error::InvalidQuestion {
+            id: String::new(),
+            reason: "wide choice requires choice criteria".into(),
+        });
+    };
+    let mut sub = IndexMap::new();
+    for &index in indices {
+        let Some((key, value)) = opts.get_index(index) else {
+            return Err(Error::InvalidQuestion {
+                id: String::new(),
+                reason: format!("choice option {index} is out of range"),
+            });
+        };
+        sub.insert(key.clone(), value.clone());
+    }
+    Question::new(
+        DecisionKind::Choice,
+        question.instructions.clone(),
+        Some(Criteria::Choice(sub)),
+    )
+}
+
+fn subset_choice_keys(question: &Question, keys: &[String]) -> Result<Question> {
+    let Some(Criteria::Choice(opts)) = &question.criteria else {
+        return Err(Error::InvalidQuestion {
+            id: String::new(),
+            reason: "wide choice requires choice criteria".into(),
+        });
+    };
+    let mut sub = IndexMap::new();
+    for key in keys {
+        let Some(value) = opts.get(key) else {
+            return Err(Error::InvalidQuestion {
+                id: String::new(),
+                reason: format!("choice option `{key}` is missing"),
+            });
+        };
+        sub.insert(key.clone(), value.clone());
+    }
+    Question::new(
+        DecisionKind::Choice,
+        question.instructions.clone(),
+        Some(Criteria::Choice(sub)),
+    )
+}
+
+impl NeuralEngine {
+    fn decide_wide(&self, request: &SystemOneRequest) -> Result<SystemOneResponse> {
+        let mut answers = IndexMap::new();
+        let mut input_tokens = 0u32;
+        for (id, question) in &request.questions {
+            if self.question_is_wide(question)? {
+                let (labels, probs, tokens) =
+                    self.choice_distribution(&request.state, id, question, 0)?;
+                input_tokens = input_tokens.saturating_add(tokens);
+                let answer = choice_from_probs(&labels, &probs).map_err(|err| match err {
+                    Error::InvalidQuestion { reason, .. } => Error::InvalidQuestion {
+                        id: id.clone(),
+                        reason,
+                    },
+                    other => other,
+                })?;
+                answers.insert(id.clone(), answer);
+            } else {
+                let (answer, tokens) = self.fitted_one(id, &request.state, question)?;
+                input_tokens = input_tokens.saturating_add(tokens);
+                answers.insert(id.clone(), answer);
+            }
+        }
+        Ok(SystemOneResponse {
+            model: self.model_id.clone(),
+            answers,
+            usage: TokenUsage {
+                input_tokens,
+                output_tokens: (request.questions.len() as u32).saturating_mul(8),
+            },
+        })
+    }
+
+    fn fitted_one(
+        &self,
+        id: &str,
+        state: &State,
+        question: &Question,
+    ) -> Result<(crate::schema::Answer, u32)> {
+        let packed = pack_question(
+            &self.tokenizer,
+            self.tokenizer.specials,
+            &self.tokenizer.mask_token,
+            state,
+            id,
+            question,
+            self.config.sequence,
+        )?;
+        let tokens = packed.input_ids.len() as u32;
+        let outputs = self.forward_packed(std::slice::from_ref(&packed))?;
+        let logits = &outputs
+            .first()
+            .ok_or_else(|| Error::Infer("empty forward".into()))?
+            .logits;
+        let answer = answer_from_logits(
+            question,
+            &packed.option_labels,
+            logits,
+            &self.config.temperatures,
+        )
+        .map_err(|err| match err {
+            Error::InvalidQuestion { reason, .. } => Error::InvalidQuestion {
+                id: id.to_string(),
+                reason,
+            },
+            other => other,
+        })?;
+        Ok((answer, tokens))
     }
 }
 

@@ -57,6 +57,7 @@ pub mod reward;
 pub mod route;
 pub mod schema;
 pub mod sequence;
+mod wide_choice;
 
 #[cfg(feature = "router")]
 pub mod router;
