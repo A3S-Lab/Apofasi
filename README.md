@@ -117,6 +117,71 @@ tasks in jev-benchmarks, and 264–276 ms p50 in
 [decision-model-benchmark](https://github.com/nibzard/decision-model-benchmark).
 Taken together, one published Jev question is **236–276 ms**.
 
+## Gate before a generative call
+
+Use Apofasi when the host already knows the question type and would otherwise
+spend a full completion to pick a label, a score, or a yes/no. Run the typed
+request first, then apply the host gate. `GatePolicy::default()` keeps an
+answer on `Auto` only when choice/score confidence is at least 0.7, or when
+noul extremity `max(noul, 1 - noul)` is at least 0.7. If every answer is
+`Auto`, keep the typed answer and do not call the generative model. If any
+answer is `Escalate`, call that model at most once. Its text is host
+evidence. It does not become the typed `Answer`.
+
+```rust
+let response = engine.decide(&request)?;
+let gates = a3s_apofasi::gate_response(&response, &a3s_apofasi::GatePolicy::default());
+if a3s_apofasi::any_escalate(&gates) {
+    // One host-side generation. Do not parse its prose into an Answer.
+} else {
+    // Use response.answers. This path makes zero generations.
+}
+```
+
+`Client::default` is the lexical engine: no weights, suitable for tests.
+On the six tasks below its overlap scores stayed under 0.7, so the gate
+always escalated and the generative call was not saved. Do not lower the
+threshold to force that path onto `Auto`; that accepts an uncertain overlap
+score.
+
+The neural english checkpoint is what can clear 0.7. Load it with `infer`
+(`NeuralEngine::load` or `load_with`). On Apple Silicon pass `metal` or
+`mlx`; `mlx` is the fast path when `MLX_ROOT` is set. Point
+`APOFASI_CHECKPOINT` at the bundle root and let the router select `english`
+for English state text.
+
+The table is one paired run of those six single-question tasks, not a
+benchmark suite. Lexical times are debug-build medians (5 warmup, 50
+calls). Neural times are release Candle Metal on an Apple M5 Max: the
+published english checkpoint, 3 warmup calls, then the p50 of 20 calls
+(`sorted[len/2]`). The generative column is one hosted DeepSeek V4.1 Flash
+completion per task (128 output-token cap, 90 s timeout), prompt plus
+completion tokens. It was not re-run beside the neural samples. Neural
+encoder usage on these rows was 40–57 input tokens and 8 output tokens per
+forward; that is not the generative token column. Labels are the gate
+signal, not a claim that they match the generative model.
+
+| Task | Lexical | Neural p50 | Neural gate | Generative model |
+| --- | --- | ---: | --- | --- |
+| Refund route | 97 µs, escalate (billing 0.11) | 16.1 ms | **Auto** (billing 0.87) | 2552 ms, 152/56 |
+| Checkout outage | 81 µs, escalate (noul 0.62) | 15.7 ms | **Auto** (noul 0.85) | 2839 ms, 144/115 |
+| Secret debug diff | 83 µs, escalate (noul 0.62) | 16.1 ms | Escalate (noul 0.42) | 2483 ms, 152/93 |
+| Search command | 87 µs, escalate (read-only 0.11) | 16.2 ms | Escalate (read-only 0.16) | 2301 ms, 151/69 |
+| Clean test command | 89 µs, escalate (mutate 0.11) | 16.0 ms | Escalate (mutate 0.55) | 2573 ms, 148/91 |
+| Force push | 78 µs, escalate (score 1.00, 0.00) | 15.1 ms | Escalate (score 1.15, 0.03) | 3495 ms, 122/128 |
+
+Two of the six neural answers cleared 0.7 and skipped the completion: about
+5.4 s and 467 tokens, at about 16 ms each. The other four still escalate, so
+the neural forward is about 16 ms added before the same completion, not a
+saving. The speedup exists only on `Auto`. A lexical forward is much
+shorter, but on this set it never reached `Auto`, so it saved nothing.
+
+```bash
+cargo run --release --features cli,metal --bin a3s-apofasi -- suite \
+  --cases cases.json --checkpoint "$APOFASI_CHECKPOINT" \
+  --device metal --warmup 3 --iters 20
+```
+
 The seven cases below are a separate local suite. Each was warmed 12 times,
 then timed for 40 calls. The figure is the p50 (upper median:
 `sorted[len/2]`). They have no published Jev accuracy to put beside them.
