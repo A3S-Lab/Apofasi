@@ -3,7 +3,14 @@
 use crate::primitive::DecisionKind;
 
 /// Normalized Shannon entropy confidence: `1 - H(p) / log(k)`.
+///
+/// Returns 0 when `probs` is not a probability distribution. Clamping zeros
+/// inside the entropy formula used to turn an all-zero vector into confidence
+/// near 1, which a host would treat as safe to automate.
 pub fn confidence_from_probs(probs: &[f32]) -> f32 {
+    if !is_distribution(probs) {
+        return 0.0;
+    }
     let k = probs.len();
     if k < 2 {
         return 1.0;
@@ -15,6 +22,20 @@ pub fn confidence_from_probs(probs: &[f32]) -> f32 {
     }
     let norm = ent / (k as f32).ln();
     (1.0 - norm).clamp(0.0, 1.0)
+}
+
+fn is_distribution(probs: &[f32]) -> bool {
+    if probs.is_empty() {
+        return false;
+    }
+    let mut sum = 0.0f32;
+    for &p in probs {
+        if !p.is_finite() || !(0.0..=1.0 + 1e-3).contains(&p) {
+            return false;
+        }
+        sum += p;
+    }
+    (sum - 1.0).abs() <= 1e-3
 }
 
 /// Temperature lookup bucket key (`"{kind}:{size}"`).
@@ -73,6 +94,16 @@ mod tests {
     fn uniform_distribution_is_low_confidence() {
         let c = confidence_from_probs(&[0.25, 0.25, 0.25, 0.25]);
         assert!(c < 0.05, "conf={c}");
+    }
+
+    #[test]
+    fn non_distribution_is_zero_confidence() {
+        assert_eq!(confidence_from_probs(&[]), 0.0);
+        assert_eq!(confidence_from_probs(&[0.0, 0.0, 0.0]), 0.0);
+        assert_eq!(confidence_from_probs(&[0.9, 0.9]), 0.0);
+        assert_eq!(confidence_from_probs(&[f32::NAN, 0.0]), 0.0);
+        assert_eq!(confidence_from_probs(&[-0.1, 1.1]), 0.0);
+        assert_eq!(confidence_from_probs(&[1.0]), 1.0);
     }
 
     #[test]

@@ -91,5 +91,6 @@ are not GA work.
 - [x] Gates escalate when confidence or noul is non-finite or outside `[0, 1]`
 - [x] Decode rejects non-finite logits and probabilities instead of emitting an answer
 - [x] Wide-choice composition errors when a group does not cover its options, instead of renormalizing the labels that remain
+- [x] Entropy confidence is 0 unless the vector is a probability distribution, so an all-zero vector cannot pass a host gate
 - [ ] GitHub CI green on that workflow (local tests are not a substitute for the hosted run)
 - [ ] Crate consumed by an A3S host (Desktop / Code / CLI) through the documented `crates/apofasi` submodule
