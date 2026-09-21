@@ -1,6 +1,10 @@
 # Apofasi
 
-**Language / 语言:** [English](README.md) · [中文](README.zh-CN.md)
+<p align="center">
+  <strong>Language / 语言:</strong>
+  <a href="README.md">English</a> ·
+  <a href="README.zh-CN.md">中文</a>
+</p>
 
 Typed decisions in one forward pass. No generation, nothing to parse.
 

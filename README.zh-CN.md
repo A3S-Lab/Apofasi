@@ -1,6 +1,10 @@
 # Apofasi
 
-**Language / 语言:** [English](README.md) · [中文](README.zh-CN.md)
+<p align="center">
+  <strong>Language / 语言:</strong>
+  <a href="README.md">English</a> ·
+  <a href="README.zh-CN.md">中文</a>
+</p>
 
 一次前向传递完成类型化决策。不生成文本，也不需要再解析。
 
