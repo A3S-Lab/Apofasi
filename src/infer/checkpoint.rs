@@ -74,6 +74,23 @@ impl CheckpointPaths {
         };
         Self::resolve(dir)
     }
+
+    /// Checkpoints in a bundle that have the host load layout.
+    ///
+    /// English may live at the bundle root. Multilingual and typed-decisions
+    /// are optional siblings. Missing siblings are omitted so hosts can preload
+    /// without shipping every pack.
+    pub fn present_in_bundle(bundle: &Path) -> Vec<crate::route::CheckpointId> {
+        use crate::route::CheckpointId;
+        [
+            CheckpointId::English,
+            CheckpointId::Multilingual,
+            CheckpointId::TypedDecisions,
+        ]
+        .into_iter()
+        .filter(|id| Self::resolve_named(bundle, *id).is_ok())
+        .collect()
+    }
 }
 
 /// Runtime knobs stored next to the weights.
@@ -89,6 +106,8 @@ pub struct AgentConfig {
     pub temperatures: TemperatureTable,
     /// Reported model name.
     pub model_name: String,
+    /// Training AMP dtype hint (`f32`, `bf16`, `fp16`). Runtime may promote on CUDA.
+    pub amp_dtype: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -103,6 +122,8 @@ struct RawAgentConfig {
     temperature: [f32; 3],
     #[serde(default)]
     temperature_by_options: BTreeMap<String, f32>,
+    #[serde(default = "default_amp_dtype")]
+    amp_dtype: String,
 }
 
 fn default_model_name() -> String {
@@ -111,6 +132,10 @@ fn default_model_name() -> String {
 
 fn default_temps() -> [f32; 3] {
     [1.0, 1.0, 1.0]
+}
+
+fn default_amp_dtype() -> String {
+    "f32".into()
 }
 
 /// Load [`AgentConfig`] from `rl_agent_config.json`.
@@ -137,6 +162,7 @@ pub fn load_agent_config(path: impl AsRef<Path>) -> Result<AgentConfig> {
             by_options,
         },
         model_name: raw.model_name,
+        amp_dtype: raw.amp_dtype,
     })
 }
 
@@ -220,6 +246,55 @@ pub fn load_encoder_config(path: impl AsRef<Path>) -> Result<super::modernbert::
         global_rope_theta,
         local_attention: raw.local_attention,
         local_rope_theta,
-        classifier_config: None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::route::CheckpointId;
+
+    fn touch_layout(dir: &Path) {
+        fs::create_dir_all(dir.join("encoder")).unwrap();
+        fs::create_dir_all(dir.join("tokenizer")).unwrap();
+        fs::write(dir.join("rl_agent_config.json"), b"{}").unwrap();
+        fs::write(dir.join("model.safetensors"), b"weights").unwrap();
+        fs::write(dir.join("encoder").join("config.json"), b"{}").unwrap();
+        fs::write(dir.join("tokenizer").join("tokenizer.json"), b"{}").unwrap();
+    }
+
+    #[test]
+    fn bundle_presence_skips_missing_siblings() {
+        let root = std::env::temp_dir().join(format!(
+            "apofasi-bundle-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = fs::remove_dir_all(&root);
+        touch_layout(&root.join("english"));
+        touch_layout(&root.join("multilingual"));
+
+        let present = CheckpointPaths::present_in_bundle(&root);
+        assert_eq!(
+            present,
+            vec![CheckpointId::English, CheckpointId::Multilingual]
+        );
+        assert!(!present.contains(&CheckpointId::TypedDecisions));
+        assert!(
+            CheckpointPaths::resolve_named(&root, CheckpointId::Multilingual).is_ok(),
+            "shipped multilingual pack stays loadable"
+        );
+
+        let english_only = root.join("english-only");
+        touch_layout(&english_only.join("english"));
+        assert!(
+            CheckpointPaths::resolve_named(&english_only, CheckpointId::Multilingual).is_err(),
+            "an English-only bundle must not pretend to contain multilingual"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
 }

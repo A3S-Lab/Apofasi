@@ -249,17 +249,20 @@ Wire events (when emitted): `apofasi.decision.completed`,
 
 | Feature | Default | Contents |
 | --- | --- | --- |
-| `core` | on | types, sequence, detect, confidence |
-| `router` | on | Router over core detect |
-| `infer` | off | Candle model + runtime |
+| `router` | on | Router over script/language detection |
+| `infer` | off | Candle `DecisionNet` + runtime |
 | `metal` | off | Candle Metal |
 | `mlx` | off | Apple MLX decision forward (prebuilt `libmlx` via `MLX_ROOT`) |
 | `cuda` | off | Candle CUDA |
+| `mkl` | off | Candle CPU matmul via Intel MKL |
+| `ort` | off | ONNX Runtime ModernBERT encoder on CPU. FP32 `encoder.opt.onnx`, else `encoder.onnx`. INT8 only when `APOFASI_ORT_QUANT=1` |
 | `train` | off | RLCD loop + dataset IO |
-| `cli` | off | binary |
+| `cli` | off | `a3s-apofasi` binary |
 
-`default = ["core", "router"]`. Desktop ships `infer` + `metal` on macOS. Darwin
-`just ap*` also enables `mlx` when a prebuilt MLX package is available.
+`default = ["router"]`. Types, sequence packing, detection, and confidence
+compile in every build; they are not a separate feature. Desktop ships
+`infer` + `metal` on macOS. Darwin `just ap*` also enables `mlx` when a
+prebuilt MLX package is available.
 
 ## Performance targets
 
@@ -267,12 +270,29 @@ Wire events (when emitted): `apofasi.decision.completed`,
 | --- | --- | --- |
 | Apple Silicon (`mlx`) | ≤ 80 ms p50 | Fused MLX kernels; f32 weights so logits match Candle |
 | Metal without `mlx` | ≤ 80 ms p50 | Candle Metal SDPA encoder; skip unused act head on decide |
-| CUDA T4-class | ≤ 40 ms p50 | when `cuda` feature is enabled |
-| CPU | ≤ 500 ms p50 | f32 fallback |
+| CUDA (Ampere+) | ≤ 40 ms p50 | Candle CUDA; loads `bf16` when checkpoint `amp_dtype` says so (`APOFASI_DTYPE` overrides). Mask cache is device-wide. |
+| CPU | ≤ 500 ms p50 | Feature `ort` + `encoder.onnx` (prefer `encoder.opt.onnx`). Candle+MKL alone cannot hit the gate on ModernBERT-large. |
 
 Batching N questions in one forward pass is mandatory for the hot path.
 The 0.1.1 Apple Silicon measurements are in the README, next to the published
-hosted Jev accuracy and latency.
+hosted Jev accuracy and latency. Use `APOFASI_PROFILE=1` to split `pack_ms` /
+`fwd_ms` on any device.
+
+### Scale 1 / Scale 3 evidence (this Windows host, warm triage)
+
+| Build / path | p50 | Gate |
+| --- | ---: | --- |
+| CUDA `APOFASI_DTYPE=bf16` english-large | 22.98 ms | ≤ 40 ms PASS; smoke answers match CPU ORT and CUDA f32 |
+| CUDA `APOFASI_DTYPE=f32` english-large | 22.38 ms | ≤ 40 ms PASS |
+| CUDA BF16 example suite | 8/8 PASS | answer checks + latency_budget |
+| CPU Candle+MKL english-large | ~1.3–1.6 s | ≤ 500 ms FAIL |
+| CPU ORT FP32 multilingual (`encoder.onnx`) | ~230–285 ms | ≤ 500 ms PASS |
+| CPU ORT FP32 english-large (`encoder.opt.onnx`) | 463.95 ms | ≤ 500 ms PASS (exact smoke parity vs CUDA f32) |
+| CUDA BF16 Banking77 (100, pilot-v1 seed) | 74.16 ms | accuracy 0.56, matches published 0.560. Groups fill `head_max_len` |
+| CPU ORT INT8 english-large (`APOFASI_ORT_QUANT=1`) | ~300 ms | faster but **breaks** confidence/gates — not default |
+
+Profile: `pack_ms` ≪ `fwd_ms`. Export ONNX with `scripts/ort_encoder_probe.py`.
+Do not share Candle/MKL weights across threads. INT8 stays opt-in.
 
 ## Roadmap (architecture milestones)
 

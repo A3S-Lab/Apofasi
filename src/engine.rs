@@ -94,7 +94,8 @@ impl DecisionEngine for LexicalEngine {
             answers,
             usage: TokenUsage {
                 input_tokens,
-                output_tokens: (request.questions.len() as u32).saturating_mul(8),
+                // System One does not generate text, so hosts must not bill a fake decode.
+                output_tokens: 0,
             },
         })
     }
@@ -242,5 +243,6 @@ mod tests {
         }
         assert!(res.model.starts_with("apofasi-lexical-"));
         assert!(res.usage.input_tokens > 0);
+        assert_eq!(res.usage.output_tokens, 0);
     }
 }

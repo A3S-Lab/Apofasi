@@ -41,6 +41,7 @@ pub fn answer_from_logits(
             ),
         });
     }
+    ensure_finite(logits, "logits")?;
     let temp = temperatures.resolve(question.type_, option_labels.len());
     let probs = softmax(logits, temp);
     match question.type_ {
@@ -108,6 +109,16 @@ fn round4(v: f32) -> f32 {
     (v * 10_000.0).round() / 10_000.0
 }
 
+fn ensure_finite(values: &[f32], what: &str) -> Result<()> {
+    if values.iter().any(|value| !value.is_finite()) {
+        return Err(Error::InvalidQuestion {
+            id: String::new(),
+            reason: format!("{what} must be finite"),
+        });
+    }
+    Ok(())
+}
+
 #[cfg(feature = "infer")]
 pub(crate) fn choice_from_probs(option_labels: &[String], probs: &[f32]) -> Result<Answer> {
     if option_labels.len() != probs.len() || option_labels.is_empty() {
@@ -120,6 +131,7 @@ pub(crate) fn choice_from_probs(option_labels: &[String], probs: &[f32]) -> Resu
             ),
         });
     }
+    ensure_finite(probs, "probabilities")?;
     let mut probabilities = BTreeMap::new();
     let mut best_i = 0usize;
     let mut best_p = f32::NEG_INFINITY;
@@ -193,5 +205,28 @@ mod tests {
         let v = serde_json::to_value(&ans).unwrap();
         assert!(v.get("confidence").is_none());
         assert!(v["noul"].as_f64().unwrap() > 0.7);
+    }
+
+    #[test]
+    fn non_finite_logits_are_rejected() {
+        let q = Question::new(DecisionKind::Noul, json!("true?"), None).unwrap();
+        for logits in [
+            [f32::NAN, 1.0],
+            [0.0, f32::INFINITY],
+            [f32::NEG_INFINITY, 0.0],
+        ] {
+            let err = answer_from_logits(
+                &q,
+                &["false".into(), "true".into()],
+                &logits,
+                &TemperatureTable::default(),
+            )
+            .expect_err("non-finite logits must not become an answer");
+            let message = err.to_string();
+            assert!(
+                message.contains("finite"),
+                "error={message} logits={logits:?}"
+            );
+        }
     }
 }

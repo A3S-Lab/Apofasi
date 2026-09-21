@@ -9,7 +9,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::Instant;
 
-use a3s_apofasi::{Answer, CheckpointId, CheckpointRegistry, DeviceRequest, SystemOneRequest};
+use a3s_apofasi::{Answer, CheckpointRegistry, DeviceRequest, SystemOneRequest};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -77,13 +77,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
 
     let mut registry =
         CheckpointRegistry::open(&checkpoint, device, 3).map_err(|e| e.to_string())?;
-    registry
-        .preload(&[
-            CheckpointId::English,
-            CheckpointId::Multilingual,
-            CheckpointId::TypedDecisions,
-        ])
-        .map_err(|e| e.to_string())?;
+    registry.preload(&[]).map_err(|e| e.to_string())?;
 
     let mut rows = Vec::with_capacity(file.cases.len());
     for case in file.cases {
@@ -104,7 +98,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
             samples.push(t0.elapsed().as_secs_f64() * 1000.0);
             last = Some(timed);
         }
-        let (ckpt, response) = last.ok_or_else(|| format!("{}: no samples", case.name))?;
+        let (decision, response) = last.ok_or_else(|| format!("{}: no samples", case.name))?;
         let p50 = percentile_50(&samples);
         let min_ms = samples.iter().copied().fold(f64::INFINITY, f64::min);
         let max_ms = samples.iter().copied().fold(f64::NEG_INFINITY, f64::max);
@@ -116,7 +110,10 @@ pub fn run(args: &[String]) -> Result<(), String> {
             "max_ms": round_ms(max_ms),
             "warmup": warmup,
             "iters": iters,
-            "routing": { "model": ckpt.as_str() },
+            "routing": {
+                "model": decision.model.as_str(),
+                "reason": decision.reason,
+            },
             "answers": compact_answers(&response.answers),
             "usage": response.usage,
         }));
@@ -179,14 +176,10 @@ fn compact_answers(answers: &indexmap::IndexMap<String, Answer>) -> Value {
                 "score": score,
                 "confidence": confidence,
             }),
-            Answer::Noul { noul } => {
-                let confidence = (noul.max(1.0 - noul) * 10_000.0).round() / 10_000.0;
-                json!({
-                    "type": "noul",
-                    "noul": noul,
-                    "confidence": confidence,
-                })
-            }
+            Answer::Noul { noul } => json!({
+                "type": "noul",
+                "noul": noul,
+            }),
         };
         map.insert(id.clone(), slim);
     }

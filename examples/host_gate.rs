@@ -1,7 +1,7 @@
 //! Host-side decision gate glue for Code / Desktop.
 //!
-//! Shows the recommended pattern: call System One, then map answers through
-//! [`GatePolicy`] before automation.
+//! Shows the recommended pattern: route, call System One, then map answers
+//! through [`GatePolicy`] before automation.
 //!
 //! ```bash
 //! cargo run --example host_gate
@@ -53,10 +53,14 @@ fn run() -> Result<(), String> {
     let response = if let Some(root) = checkpoint {
         #[cfg(feature = "infer")]
         {
-            use a3s_apofasi::{DeviceRequest, NeuralEngine};
-            let engine =
-                NeuralEngine::load_with(&root, DeviceRequest::Auto).map_err(|e| e.to_string())?;
-            engine.decide(&req).map_err(|e| e.to_string())?
+            use a3s_apofasi::{CheckpointRegistry, DeviceRequest};
+            let mut registry = CheckpointRegistry::open(&root, DeviceRequest::Auto, 3)
+                .map_err(|e| e.to_string())?;
+            let (route, response) = registry
+                .system_one_routed(req, None, None)
+                .map_err(|e| e.to_string())?;
+            println!("route={} reason={}", route.model.as_str(), route.reason);
+            response
         }
         #[cfg(not(feature = "infer"))]
         {

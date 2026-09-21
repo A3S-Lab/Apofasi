@@ -6,15 +6,14 @@
 //! - See modernbert in [candle-examples](https://github.com/huggingface/candle/tree/main/candle-examples/) for runnable code
 //!
 
-use candle_core::{DType, Device, IndexOp, Result, Tensor, D};
+use candle_core::{DType, Device, Result, Tensor, D};
 use candle_nn::{
-    embedding, layer_norm_no_bias, linear, linear_no_bias, ops::softmax, Embedding, LayerNorm,
-    Linear, Module, VarBuilder,
+    embedding, layer_norm_no_bias, linear_no_bias, ops::softmax, Embedding, LayerNorm, Linear,
+    Module, VarBuilder,
 };
 use serde::Deserialize;
 
 use core::f32;
-use std::collections::HashMap;
 use std::sync::Arc;
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -31,24 +30,6 @@ pub struct Config {
     pub global_rope_theta: f64,
     pub local_attention: usize,
     pub local_rope_theta: f64,
-    #[serde(default)]
-    #[serde(flatten)]
-    pub classifier_config: Option<ClassifierConfig>,
-}
-
-#[derive(Debug, Clone, Deserialize, PartialEq, Copy, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum ClassifierPooling {
-    #[default]
-    CLS,
-    MEAN,
-}
-
-#[derive(Debug, Clone, PartialEq, Deserialize)]
-pub struct ClassifierConfig {
-    pub id2label: HashMap<String, String>,
-    pub label2id: HashMap<String, String>,
-    pub classifier_pooling: ClassifierPooling,
 }
 
 #[derive(Debug, Clone)]
@@ -226,52 +207,6 @@ impl ModernBertLayer {
     }
 }
 
-#[derive(Clone)]
-pub struct ModernBertHead {
-    dense: Linear,
-    norm: LayerNorm,
-}
-
-impl ModernBertHead {
-    fn load(vb: VarBuilder, config: &Config) -> Result<Self> {
-        let dense = linear_no_bias(config.hidden_size, config.hidden_size, vb.pp("dense"))?;
-        let norm = layer_norm_no_bias(config.hidden_size, config.layer_norm_eps, vb.pp("norm"))?;
-        Ok(Self { dense, norm })
-    }
-}
-
-impl Module for ModernBertHead {
-    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let xs = xs.apply(&self.dense)?.gelu_erf()?.apply(&self.norm)?;
-        Ok(xs)
-    }
-}
-
-#[derive(Clone)]
-pub struct ModernBertDecoder {
-    decoder: Linear,
-}
-
-impl ModernBertDecoder {
-    fn load(vb: VarBuilder, config: &Config) -> Result<Self> {
-        // The decoder weights are tied with the embeddings layer weights
-        let decoder_weights = vb.get(
-            (config.vocab_size, config.hidden_size),
-            "model.embeddings.tok_embeddings.weight",
-        )?;
-        let decoder_bias = vb.get(config.vocab_size, "decoder.bias")?;
-        let decoder = Linear::new(decoder_weights, Some(decoder_bias));
-        Ok(Self { decoder })
-    }
-}
-
-impl Module for ModernBertDecoder {
-    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let xs = xs.apply(&self.decoder)?;
-        Ok(xs)
-    }
-}
-
 // Global attention mask calculated from padded token inputs
 fn prepare_4d_attention_mask(
     mask: &Tensor,
@@ -282,15 +217,19 @@ fn prepare_4d_attention_mask(
     let src_len = mask.dim(1)?;
     let tgt_len = tgt_len.unwrap_or(src_len);
 
+    // Cast before expand so padding ids never participate in f32 arithmetic as U32.
     let expanded_mask = mask
+        .to_dtype(dtype)?
         .unsqueeze(1)?
         .unsqueeze(2)?
-        .expand((bsz, 1, tgt_len, src_len))?
-        .to_dtype(dtype)?;
+        .expand((bsz, 1, tgt_len, src_len))?;
 
-    let inverted_mask = (1.0 - expanded_mask)?;
-
-    (inverted_mask * f32::MIN as f64)?.to_dtype(dtype)
+    let inverted_mask = (Tensor::ones_like(&expanded_mask)? - &expanded_mask)?;
+    let min = match dtype {
+        DType::F32 | DType::F16 | DType::BF16 => f32::MIN as f64,
+        _ => f32::MIN as f64,
+    };
+    (inverted_mask * min)?.to_dtype(dtype)
 }
 
 // Attention mask caused by the sliding window
@@ -314,6 +253,9 @@ fn get_local_attention_mask(
 }
 
 // ModernBERT backbone
+/// Cached encoder masks: (batch, seq_len, all_ones, global, local).
+type CachedMasks = (usize, usize, bool, Tensor, Tensor);
+
 pub struct ModernBert {
     word_embeddings: Embedding,
     norm: LayerNorm,
@@ -321,8 +263,7 @@ pub struct ModernBert {
     final_norm: LayerNorm,
     local_attention_size: usize,
     num_attention_heads: usize,
-    /// Cached Metal SDPA masks: (batch, seq_len, all_ones, global, local).
-    mask_cache: std::sync::Mutex<Option<(usize, usize, bool, Tensor, Tensor)>>,
+    mask_cache: std::sync::Mutex<Option<CachedMasks>>,
 }
 
 impl Clone for ModernBert {
@@ -396,12 +337,8 @@ impl ModernBert {
         })
     }
 
-    pub fn forward(&self, xs: &Tensor, mask: &Tensor) -> Result<Tensor> {
-        self.forward_with_pad_hint(xs, mask, None)
-    }
-
-    /// Like [`Self::forward`], but `all_ones` avoids a device sync when the caller
-    /// already knows the attention mask is dense.
+    /// Encoder forward. `all_ones` skips a device sync when the caller already
+    /// knows the attention mask is dense.
     pub fn forward_with_pad_hint(
         &self,
         xs: &Tensor,
@@ -415,9 +352,12 @@ impl ModernBert {
             None => mask.to_dtype(DType::F32)?.min_all()?.to_scalar::<f32>()? >= 1.0,
         };
         let (global_mask, local_mask) = {
-            let mut guard = self.mask_cache.lock().unwrap();
+            let mut guard = self
+                .mask_cache
+                .lock()
+                .unwrap_or_else(|err| err.into_inner());
             let hit = guard.as_ref().and_then(|(cb, cl, cones, g, l)| {
-                if *cb == b && *cl == seq_len && *cones == all_ones && xs.device().is_metal() {
+                if *cb == b && *cl == seq_len && *cones == all_ones {
                     Some((g.clone(), l.clone()))
                 } else {
                     None
@@ -426,6 +366,7 @@ impl ModernBert {
             if let Some(pair) = hit {
                 pair
             } else {
+                // Build masks in f32 (stable with U32 padding inputs), then cast at use.
                 let mask_dtype = DType::F32;
                 let global_attention_mask =
                     prepare_4d_attention_mask(mask, mask_dtype, None)?.to_device(xs.device())?;
@@ -446,9 +387,8 @@ impl ModernBert {
                     let local = global_attention_mask.broadcast_add(&local_attention_mask)?;
                     (global_attention_mask, local)
                 };
-                if xs.device().is_metal() {
-                    *guard = Some((b, seq_len, all_ones, global.clone(), local.clone()));
-                }
+                // Cache on every device: rebuilding masks each call was pure overhead.
+                *guard = Some((b, seq_len, all_ones, global.clone(), local.clone()));
                 (global, local)
             }
         };
@@ -460,110 +400,15 @@ impl ModernBert {
             } else {
                 &global_mask
             };
-            xs = layer.forward(&xs, attention_mask)?;
+            // Half-precision activations need the additive mask in the same dtype.
+            let attention_mask = if attention_mask.dtype() == xs.dtype() {
+                attention_mask.clone()
+            } else {
+                attention_mask.to_dtype(xs.dtype())?
+            };
+            xs = layer.forward(&xs, &attention_mask)?;
         }
         let xs = xs.apply(&self.final_norm)?;
-        Ok(xs)
-    }
-}
-
-// ModernBERT for the fill-mask task
-#[derive(Clone)]
-pub struct ModernBertForMaskedLM {
-    model: ModernBert,
-    decoder: ModernBertDecoder,
-    head: ModernBertHead,
-}
-
-impl ModernBertForMaskedLM {
-    pub fn load(vb: VarBuilder, config: &Config) -> Result<Self> {
-        let model = ModernBert::load(vb.clone(), config)?;
-        let decoder = ModernBertDecoder::load(vb.clone(), config)?;
-        let head = ModernBertHead::load(vb.pp("head"), config)?;
-        Ok(Self {
-            model,
-            decoder,
-            head,
-        })
-    }
-
-    pub fn forward(&self, xs: &Tensor, mask: &Tensor) -> Result<Tensor> {
-        let xs = self
-            .model
-            .forward(xs, mask)?
-            .apply(&self.head)?
-            .apply(&self.decoder)?;
-        Ok(xs)
-    }
-}
-
-#[derive(Clone)]
-pub struct ModernBertClassifier {
-    classifier: Linear,
-}
-
-impl ModernBertClassifier {
-    fn load(vb: VarBuilder, config: &Config) -> Result<Self> {
-        // The decoder weights are tied with the embeddings layer weights
-        let classifier = linear(
-            config.hidden_size,
-            config
-                .classifier_config
-                .as_ref()
-                .map(|cc| cc.id2label.len())
-                .unwrap_or_default(),
-            vb.pp("classifier"),
-        )?;
-        Ok(Self { classifier })
-    }
-}
-
-impl Module for ModernBertClassifier {
-    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let xs = xs.apply(&self.classifier)?;
-        softmax(&xs, D::Minus1)
-    }
-}
-
-#[derive(Clone)]
-pub struct ModernBertForSequenceClassification {
-    model: ModernBert,
-    head: ModernBertHead,
-    classifier: ModernBertClassifier,
-    classifier_pooling: ClassifierPooling,
-}
-
-impl ModernBertForSequenceClassification {
-    pub fn load(vb: VarBuilder, config: &Config) -> Result<Self> {
-        let model = ModernBert::load(vb.clone(), config)?;
-        let classifier = ModernBertClassifier::load(vb.clone(), config)?;
-        let head = ModernBertHead::load(vb.pp("head"), config)?;
-        Ok(Self {
-            model,
-            head,
-            classifier,
-            classifier_pooling: config
-                .classifier_config
-                .as_ref()
-                .map(|cc| cc.classifier_pooling)
-                .unwrap_or_default(),
-        })
-    }
-
-    pub fn forward(&self, xs: &Tensor, mask: &Tensor) -> Result<Tensor> {
-        let output = self.model.forward(xs, mask)?;
-        let last_hidden_state = match self.classifier_pooling {
-            ClassifierPooling::CLS => output.i((.., 0, ..))?.contiguous()?,
-            ClassifierPooling::MEAN => {
-                let unsqueezed_mask = &mask.unsqueeze(D::Minus1)?.to_dtype(DType::F32)?;
-                let sum_output = output.broadcast_mul(unsqueezed_mask)?.sum(1)?;
-                sum_output.broadcast_div(&mask.sum_keepdim(1)?.to_dtype(DType::F32)?)?
-            }
-        };
-        let xs = self
-            .head
-            .forward(&last_hidden_state)?
-            .apply(&self.classifier)?;
         Ok(xs)
     }
 }

@@ -1,6 +1,8 @@
 //! Neural [`DecisionEngine`] backed by [`DecisionNet`].
 
 use std::path::Path;
+#[cfg(any(test, feature = "ort"))]
+use std::path::PathBuf;
 
 use candle_core::{DType, Device};
 use candle_nn::VarBuilder;
@@ -8,7 +10,7 @@ use indexmap::IndexMap;
 
 use super::checkpoint::{load_agent_config, load_encoder_config, AgentConfig, CheckpointPaths};
 use super::decision_net::{ActOutput, BatchItem, DecisionNet};
-use super::device::{resolve_device, DeviceRequest};
+use super::device::{resolve_device, weight_dtype, DeviceRequest};
 #[cfg(feature = "mlx")]
 use super::mlx_decision::MlxDecision;
 use super::tokenizer::HfTokenizer;
@@ -66,10 +68,32 @@ impl NeuralEngine {
             });
         }
 
+        let dtype = weight_dtype(&device, &config.amp_dtype);
         let vb = unsafe {
-            VarBuilder::from_mmaped_safetensors(&[paths.weights.as_path()], DType::F32, &device)
+            VarBuilder::from_mmaped_safetensors(&[paths.weights.as_path()], dtype, &device)
         }
         .map_err(|e| Error::Checkpoint(format!("mmap safetensors: {e}")))?;
+
+        #[cfg(feature = "ort")]
+        if device.is_cpu() {
+            let onnx = select_ort_encoder(&paths.root);
+            if let Some(onnx) = onnx {
+                let net = DecisionNet::load_with_ort_encoder(
+                    vb,
+                    &enc_cfg,
+                    config.head_layers,
+                    &device,
+                    &onnx,
+                )?;
+                return Ok(Self {
+                    net: EngineNet::Candle(net),
+                    tokenizer,
+                    config,
+                    model_id,
+                    device,
+                });
+            }
+        }
 
         let net = DecisionNet::load(vb, &enc_cfg, config.head_layers, &device)?;
 
@@ -80,6 +104,11 @@ impl NeuralEngine {
             model_id,
             device,
         })
+    }
+
+    /// Compute dtype used for Candle weights on this engine.
+    pub fn weight_dtype(&self) -> DType {
+        weight_dtype(&self.device, &self.config.amp_dtype)
     }
 
     /// Device currently hosting weights.
@@ -154,7 +183,17 @@ impl NeuralEngine {
         )?;
         let tokens = packed.input_ids.len() as u32;
         let labels = packed.option_labels.clone();
+        let profile = std::env::var_os("APOFASI_PROFILE").is_some();
+        let t_fwd = std::time::Instant::now();
         let outputs = self.forward_packed(std::slice::from_ref(&packed))?;
+        if profile {
+            eprintln!(
+                "apofasi.profile direct_fwd_ms={:.2} seq={} labels={}",
+                t_fwd.elapsed().as_secs_f64() * 1000.0,
+                packed.input_ids.len(),
+                labels.len()
+            );
+        }
         let logits = &outputs
             .first()
             .ok_or_else(|| Error::Infer("empty forward".into()))?
@@ -219,7 +258,18 @@ impl NeuralEngine {
             jobs.push(Some(packed));
         }
         let packed_jobs: Vec<PackedQuestion> = jobs.iter().filter_map(|job| job.clone()).collect();
+        let profile = std::env::var_os("APOFASI_PROFILE").is_some();
+        let t_fwd = std::time::Instant::now();
         let outputs = self.forward_packed(&packed_jobs)?;
+        if profile {
+            let seq = packed_jobs.first().map(|p| p.input_ids.len()).unwrap_or(0);
+            eprintln!(
+                "apofasi.profile wide_fwd_ms={:.2} batch={} seq={} depth={depth}",
+                t_fwd.elapsed().as_secs_f64() * 1000.0,
+                packed_jobs.len(),
+                seq
+            );
+        }
         let mut output_at = 0usize;
         let mut chunk_probs = Vec::with_capacity(groups.len());
         let mut winner_keys = Vec::with_capacity(groups.len());
@@ -261,7 +311,14 @@ impl NeuralEngine {
             tokens = tokens.saturating_add(winner_tokens);
             probs
         };
-        let composed = compose_grouped_probs(labels.len(), &groups, &chunk_probs, &winner_probs);
+        let composed = compose_grouped_probs(labels.len(), &groups, &chunk_probs, &winner_probs)
+            .map_err(|err| match err {
+                Error::InvalidQuestion { reason, .. } => Error::InvalidQuestion {
+                    id: question_id.to_string(),
+                    reason,
+                },
+                other => other,
+            })?;
         Ok((labels, composed, tokens))
     }
 }
@@ -354,7 +411,8 @@ impl DecisionEngine for NeuralEngine {
             answers,
             usage: TokenUsage {
                 input_tokens,
-                output_tokens: (request.questions.len() as u32).saturating_mul(8),
+                // System One does not generate text, so hosts must not bill a fake decode.
+                output_tokens: 0,
             },
         })
     }
@@ -452,7 +510,8 @@ impl NeuralEngine {
             answers,
             usage: TokenUsage {
                 input_tokens,
-                output_tokens: (request.questions.len() as u32).saturating_mul(8),
+                // System One does not generate text, so hosts must not bill a fake decode.
+                output_tokens: 0,
             },
         })
     }
@@ -513,6 +572,49 @@ fn sanitize_id(name: &str) -> String {
     }
 }
 
+/// True only for an explicit opt-in (`1`, `true`, `yes`, `on`).
+///
+/// Unset, empty, `0`, and `false` stay off. INT8 must not turn on because the
+/// variable happens to be present.
+#[cfg(any(test, feature = "ort"))]
+fn ort_quant_requested(value: Option<&str>) -> bool {
+    matches!(
+        value.map(str::trim),
+        Some("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON")
+    )
+}
+
+/// Choose the ONNX encoder file beside a checkpoint.
+///
+/// Order when quantization is off: `encoder.opt.onnx`, then `encoder.onnx`.
+/// `encoder.int8.onnx` is selected only when `want_quant` is true. A directory
+/// that contains only the INT8 file falls back to the Candle encoder so host
+/// gates keep FP32 confidence.
+#[cfg(any(test, feature = "ort"))]
+fn select_ort_encoder_path(root: &Path, want_quant: bool) -> Option<PathBuf> {
+    let int8 = root.join("encoder.int8.onnx");
+    let opt = root.join("encoder.opt.onnx");
+    let fp32 = root.join("encoder.onnx");
+    if want_quant && int8.is_file() {
+        return Some(int8);
+    }
+    if opt.is_file() {
+        return Some(opt);
+    }
+    if fp32.is_file() {
+        return Some(fp32);
+    }
+    None
+}
+
+/// Prefer graph-optimized FP32 `encoder.opt.onnx`, then `encoder.onnx`.
+/// Opt into INT8 with `APOFASI_ORT_QUANT=1` when `encoder.int8.onnx` is present.
+#[cfg(feature = "ort")]
+fn select_ort_encoder(root: &Path) -> Option<PathBuf> {
+    let raw = std::env::var("APOFASI_ORT_QUANT").ok();
+    select_ort_encoder_path(root, ort_quant_requested(raw.as_deref()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -530,6 +632,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(feature = "mlx"), allow(clippy::infallible_destructuring_match))]
     fn batched_forward_matches_per_question() {
         let Some(root) = std::env::var_os("APOFASI_CHECKPOINT") else {
             eprintln!("skip: set APOFASI_CHECKPOINT");
@@ -581,8 +684,10 @@ mod tests {
             packed[1].input_ids.len(),
             "batch padding is only proven when sequence lengths differ"
         );
-        let EngineNet::Candle(net) = &engine.net else {
-            panic!("CPU load should use the Candle backend");
+        let net = match &engine.net {
+            EngineNet::Candle(net) => net,
+            #[cfg(feature = "mlx")]
+            EngineNet::Mlx(_) => panic!("CPU load should use the Candle backend"),
         };
         let singles: Vec<ForwardOutput> = packed
             .iter()
@@ -611,5 +716,70 @@ mod tests {
                 batch.logits
             );
         }
+    }
+
+    #[test]
+    fn ort_quant_flag_is_explicit() {
+        assert!(!ort_quant_requested(None));
+        assert!(!ort_quant_requested(Some("")));
+        assert!(!ort_quant_requested(Some("0")));
+        assert!(!ort_quant_requested(Some("false")));
+        assert!(!ort_quant_requested(Some("no")));
+        assert!(ort_quant_requested(Some("1")));
+        assert!(ort_quant_requested(Some("true")));
+        assert!(ort_quant_requested(Some(" yes ")));
+        assert!(ort_quant_requested(Some("on")));
+    }
+
+    #[test]
+    fn ort_encoder_selection_keeps_int8_opt_in() {
+        let root = std::env::temp_dir().join(format!(
+            "apofasi-ort-select-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        let int8 = root.join("encoder.int8.onnx");
+        std::fs::write(&int8, b"int8").unwrap();
+        assert!(
+            select_ort_encoder_path(&root, false).is_none(),
+            "INT8 alone must not replace the Candle encoder"
+        );
+        assert_eq!(
+            select_ort_encoder_path(&root, true).as_deref(),
+            Some(int8.as_path())
+        );
+
+        let fp32 = root.join("encoder.onnx");
+        std::fs::write(&fp32, b"fp32").unwrap();
+        assert_eq!(
+            select_ort_encoder_path(&root, false).as_deref(),
+            Some(fp32.as_path())
+        );
+
+        let opt = root.join("encoder.opt.onnx");
+        std::fs::write(&opt, b"opt").unwrap();
+        assert_eq!(
+            select_ort_encoder_path(&root, false).as_deref(),
+            Some(opt.as_path())
+        );
+        assert_eq!(
+            select_ort_encoder_path(&root, true).as_deref(),
+            Some(int8.as_path())
+        );
+
+        std::fs::remove_file(&int8).unwrap();
+        assert_eq!(
+            select_ort_encoder_path(&root, true).as_deref(),
+            Some(opt.as_path()),
+            "quant opt-in with no INT8 file stays on the FP32 graph"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

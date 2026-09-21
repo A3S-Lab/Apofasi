@@ -11,8 +11,8 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use a3s_apofasi::{
-    gate_response, Answer, Criteria, DecisionEngine, DecisionKind, DeviceRequest, GatePolicy,
-    LexicalEngine, NeuralEngine, Question, State, SystemOneRequest, SystemOneResponse,
+    gate_response, Answer, CheckpointRegistry, Criteria, DecisionEngine, DecisionKind,
+    DeviceRequest, GatePolicy, LexicalEngine, Question, State, SystemOneRequest, SystemOneResponse,
 };
 use indexmap::IndexMap;
 use serde_json::{json, Value};
@@ -60,7 +60,7 @@ fn main() -> ExitCode {
 
 fn print_help() {
     eprintln!(
-        "Usage:\n  a3s-apofasi smoke [--lexical] [--json] [--checkpoint DIR] [--device auto|metal|cuda|cpu]\n  a3s-apofasi bench [--checkpoint DIR] [--device auto|metal|cuda|cpu] [--iters N] [--warmup N] [--case smoke|triage]\n  a3s-apofasi suite --cases FILE [--checkpoint DIR] [--device auto|metal|cuda|cpu] [--warmup N] [--iters N]\n"
+        "Usage:\n  a3s-apofasi smoke [--lexical] [--json] [--checkpoint DIR] [--device auto|metal|cuda|cpu]\n  a3s-apofasi bench [--checkpoint DIR] [--device auto|metal|cuda|cpu] [--iters N] [--warmup N] [--case smoke|triage|wide]\n  a3s-apofasi suite --cases FILE [--checkpoint DIR] [--device auto|metal|cuda|cpu] [--warmup N] [--iters N]\n"
     );
 }
 
@@ -232,6 +232,34 @@ fn triage_request() -> SystemOneRequest {
     }
 }
 
+/// 72-way choice, the Banking77 shape: labels do not fit `head_max_len`.
+fn wide_request() -> SystemOneRequest {
+    let mut opts = IndexMap::new();
+    for i in 0..72 {
+        opts.insert(
+            format!("label_{i:03}"),
+            Some(json!(format!("intent {i:03}"))),
+        );
+    }
+    let mut questions = IndexMap::new();
+    questions.insert(
+        "intent".into(),
+        Question::new(
+            DecisionKind::Choice,
+            json!("Which single label best describes the input text?"),
+            Some(Criteria::Choice(opts)),
+        )
+        .unwrap(),
+    );
+    SystemOneRequest {
+        model: None,
+        state: State::Text(
+            "I was charged twice for the same card payment and need the duplicate reversed.".into(),
+        ),
+        questions,
+    }
+}
+
 fn compact_answers(res: &SystemOneResponse) -> Value {
     let mut out = serde_json::Map::new();
     for (key, answer) in &res.answers {
@@ -263,7 +291,7 @@ fn compact_answers(res: &SystemOneResponse) -> Value {
 fn gates_json(gates: &std::collections::BTreeMap<String, a3s_apofasi::GateAction>) -> Value {
     let mut out = serde_json::Map::new();
     for (k, v) in gates {
-        out.insert(k.clone(), json!(format!("{v:?}")));
+        out.insert(k.clone(), json!(v.as_str()));
     }
     Value::Object(out)
 }
@@ -297,25 +325,35 @@ fn run_smoke(args: &[String]) -> Result<(), String> {
     let ckpt = opts
         .checkpoint
         .ok_or("set APOFASI_CHECKPOINT or pass --checkpoint (or use --lexical)")?;
-    let engine = NeuralEngine::load_with(&ckpt, opts.device).map_err(|e| e.to_string())?;
-    let res = engine.decide(&req).map_err(|e| e.to_string())?;
+    let mut registry =
+        CheckpointRegistry::open(&ckpt, opts.device, 3).map_err(|e| e.to_string())?;
+    let (route, res) = registry
+        .system_one_routed(req, None, None)
+        .map_err(|e| e.to_string())?;
+    let device = registry
+        .get(route.model)
+        .map(|engine| format!("{:?}", engine.device()))
+        .unwrap_or_else(|| "unloaded".into());
     let gates = gate_response(&res, &GatePolicy::default());
     if opts.json {
         println!(
             "{}",
             json!({
                 "backend": "neural",
+                "route": route.model.as_str(),
+                "route_reason": route.reason,
                 "model": res.model,
-                "device": format!("{:?}", engine.device()),
+                "device": device,
                 "answers": compact_answers(&res),
                 "gates": gates_json(&gates),
             })
         );
     } else {
         println!(
-            "ok neural model={} device={:?} answers={} gates={gates:?}",
+            "ok neural route={} reason={:?} model={} device={device} answers={} gates={gates:?}",
+            route.model.as_str(),
+            route.reason,
             res.model,
-            engine.device(),
             res.answers.len()
         );
     }
@@ -327,28 +365,45 @@ fn run_bench(args: &[String]) -> Result<(), String> {
     let ckpt = opts
         .checkpoint
         .ok_or("bench requires APOFASI_CHECKPOINT or --checkpoint")?;
-    let engine = NeuralEngine::load_with(&ckpt, opts.device).map_err(|e| e.to_string())?;
+    let mut registry =
+        CheckpointRegistry::open(&ckpt, opts.device, 3).map_err(|e| e.to_string())?;
     let req = match opts.case.as_str() {
         "smoke" => sample_request(),
         "triage" => triage_request(),
-        other => return Err(format!("unknown --case {other} (smoke|triage)")),
+        "wide" => wide_request(),
+        other => return Err(format!("unknown --case {other} (smoke|triage|wide)")),
     };
+    let mut last_route = None;
     for _ in 0..opts.warmup {
-        let _ = engine.decide(&req).map_err(|e| e.to_string())?;
+        let (route, _) = registry
+            .system_one_routed(req.clone(), None, None)
+            .map_err(|e| e.to_string())?;
+        last_route = Some(route);
     }
     let mut times = Vec::with_capacity(opts.iters);
     for _ in 0..opts.iters {
         let t0 = Instant::now();
-        let _ = engine.decide(&req).map_err(|e| e.to_string())?;
+        let (route, _) = registry
+            .system_one_routed(req.clone(), None, None)
+            .map_err(|e| e.to_string())?;
         times.push(t0.elapsed().as_secs_f64() * 1000.0);
+        last_route = Some(route);
     }
+    let route = last_route.ok_or("bench produced no samples")?;
+    let engine = registry
+        .get(route.model)
+        .ok_or("routed checkpoint was not resident")?;
     times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    if times.is_empty() {
+        return Err("bench requires --iters >= 1".into());
+    }
     let p50 = times[times.len() / 2];
     let mean = times.iter().sum::<f64>() / times.len() as f64;
     println!(
-        "bench case={} questions={} model={} device={:?} iters={} warmup={} p50_ms={:.2} mean_ms={:.2}",
+        "bench case={} questions={} route={} model={} device={:?} iters={} warmup={} p50_ms={:.2} mean_ms={:.2}",
         opts.case,
         req.questions.len(),
+        route.model.as_str(),
         engine.model_id(),
         engine.device(),
         opts.iters,

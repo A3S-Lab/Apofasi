@@ -1,3 +1,6 @@
+.tmp-ort/
+.tmp-ort-*/
+.tmp-cpu-*.txt
 /target/
 **/*.rs.bk
 Cargo.lock

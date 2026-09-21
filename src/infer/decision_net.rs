@@ -4,6 +4,8 @@ use candle_core::{Device, IndexOp, Result as CandleResult, Tensor, D};
 use candle_nn::{embedding, layer_norm, linear, Embedding, LayerNorm, Linear, Module, VarBuilder};
 
 use super::modernbert::{Config as EncoderConfig, ModernBert};
+#[cfg(feature = "ort")]
+use super::ort_encoder::OrtEncoder;
 use crate::error::{Error, Result};
 
 /// Outputs of one forward pass.
@@ -24,9 +26,39 @@ pub struct ActOutput {
     pub escalate: f32,
 }
 
+enum EncoderImpl {
+    Candle(ModernBert),
+    #[cfg(feature = "ort")]
+    Ort(OrtEncoder),
+}
+
+impl EncoderImpl {
+    fn forward(&self, ids: &Tensor, attn: &Tensor, all_ones: Option<bool>) -> CandleResult<Tensor> {
+        match self {
+            Self::Candle(enc) => enc.forward_with_pad_hint(ids, attn, all_ones),
+            #[cfg(feature = "ort")]
+            Self::Ort(enc) => enc.forward(ids, attn),
+        }
+    }
+
+    #[cfg(feature = "ort")]
+    fn forward_packed_ort(
+        &self,
+        ids: &[u32],
+        mask: &[u32],
+        b: usize,
+        l: usize,
+    ) -> CandleResult<Option<Tensor>> {
+        match self {
+            Self::Ort(enc) => Ok(Some(enc.forward_packed(ids, mask, b, l)?)),
+            Self::Candle(_) => Ok(None),
+        }
+    }
+}
+
 /// Full decision model: encoder → type emb → transformer head → scorer / act.
 pub struct DecisionNet {
-    encoder: ModernBert,
+    encoder: EncoderImpl,
     type_emb: Embedding,
     head: Vec<EncoderLayer>,
     scorer_norm: LayerNorm,
@@ -53,8 +85,46 @@ impl DecisionNet {
             });
         let encoder = ModernBert::load(enc_vb, enc_cfg)
             .map_err(|e| Error::Checkpoint(format!("load encoder: {e}")))?;
+        Self::load_heads(
+            vb,
+            enc_cfg.hidden_size,
+            head_layers,
+            device,
+            EncoderImpl::Candle(encoder),
+        )
+    }
 
-        let d = enc_cfg.hidden_size;
+    /// CPU Scale-3 path: ORT ModernBERT encoder + Candle typed head.
+    #[cfg(feature = "ort")]
+    pub fn load_with_ort_encoder(
+        vb: VarBuilder,
+        enc_cfg: &EncoderConfig,
+        head_layers: usize,
+        device: &Device,
+        onnx: impl AsRef<std::path::Path>,
+    ) -> Result<Self> {
+        if !device.is_cpu() {
+            return Err(Error::Checkpoint(
+                "ORT encoder is only supported on CPU".into(),
+            ));
+        }
+        let encoder = OrtEncoder::load(onnx, enc_cfg.hidden_size)?;
+        Self::load_heads(
+            vb,
+            enc_cfg.hidden_size,
+            head_layers,
+            device,
+            EncoderImpl::Ort(encoder),
+        )
+    }
+
+    fn load_heads(
+        vb: VarBuilder,
+        d: usize,
+        head_layers: usize,
+        device: &Device,
+        encoder: EncoderImpl,
+    ) -> Result<Self> {
         let type_emb = embedding(3, d, vb.pp("type_emb"))
             .map_err(|e| Error::Checkpoint(format!("load type_emb: {e}")))?;
 
@@ -201,12 +271,24 @@ impl DecisionNet {
             }
         }
 
-        let ids = Tensor::from_vec(ids_flat, (batch, max_len), &self.device)?;
         let all_ones = attn_flat.iter().all(|&x| x == 1);
-        let attn = Tensor::from_vec(attn_flat, (batch, max_len), &self.device)?;
-        let mut h = self
+        #[cfg(feature = "ort")]
+        let mut h = if let Some(hidden) = self
             .encoder
-            .forward_with_pad_hint(&ids, &attn, Some(all_ones))?; // [B, L, D]
+            .forward_packed_ort(&ids_flat, &attn_flat, batch, max_len)?
+        {
+            hidden
+        } else {
+            let ids = Tensor::from_vec(ids_flat, (batch, max_len), &self.device)?;
+            let attn = Tensor::from_vec(attn_flat, (batch, max_len), &self.device)?;
+            self.encoder.forward(&ids, &attn, Some(all_ones))?
+        };
+        #[cfg(not(feature = "ort"))]
+        let mut h = {
+            let ids = Tensor::from_vec(ids_flat, (batch, max_len), &self.device)?;
+            let attn = Tensor::from_vec(attn_flat, (batch, max_len), &self.device)?;
+            self.encoder.forward(&ids, &attn, Some(all_ones))?
+        };
 
         let qtypes: Vec<u32> = items.iter().map(|item| u32::from(item.qtype)).collect();
         let q = Tensor::from_vec(qtypes, batch, &self.device)?;
@@ -243,6 +325,7 @@ impl DecisionNet {
             .gelu()?
             .apply(&self.scorer_fc2)?
             .squeeze(1)?
+            .to_dtype(candle_core::DType::F32)?
             .to_vec1::<f32>()?;
 
         let mut outputs = Vec::with_capacity(batch);
@@ -262,7 +345,8 @@ impl DecisionNet {
                     e / k.ln()
                 };
                 let (top1, margin) = top2_margin(&probs);
-                let feats = Tensor::new(&[top1, margin, ent, k / 255.0], &self.device)?;
+                let feats = Tensor::new(&[top1, margin, ent, k / 255.0], &self.device)?
+                    .to_dtype(h.dtype())?;
                 let pooled = h.i((row, 0))?;
                 Tensor::cat(&[&pooled, &feats], 0)?
                     .unsqueeze(0)?
@@ -270,6 +354,7 @@ impl DecisionNet {
                     .gelu()?
                     .apply(&self.act_fc2)?
                     .squeeze(0)?
+                    .to_dtype(candle_core::DType::F32)?
                     .to_vec1::<f32>()?
             } else {
                 Vec::new()

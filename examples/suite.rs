@@ -523,15 +523,15 @@ fn run_case(
                 .system_one_routed(request.clone(), None, None)
                 .map_err(|e| e.to_string())?;
             let t0 = Instant::now();
-            let (ckpt, response) = reg
+            let (decision, response) = reg
                 .system_one_routed(request.clone(), None, None)
                 .map_err(|e| e.to_string())?;
             let latency_ms = t0.elapsed().as_secs_f64() * 1000.0;
             let mut failures = Vec::new();
-            if ckpt != CheckpointId::Multilingual {
+            if decision.model != CheckpointId::Multilingual {
                 failures.push(format!(
                     "expected routed multilingual, got {}",
-                    ckpt.as_str()
+                    decision.model.as_str()
                 ));
             }
             match response.answers.get("department") {
@@ -542,7 +542,13 @@ fn run_case(
             }
             let mut output = output_payload(&response, latency_ms, &failures);
             if let Some(obj) = output.as_object_mut() {
-                obj.insert("routing".into(), json!({ "checkpoint": ckpt.as_str() }));
+                obj.insert(
+                    "routing".into(),
+                    json!({
+                        "checkpoint": decision.model.as_str(),
+                        "reason": decision.reason,
+                    }),
+                );
             }
             Ok((output, latency_ms, failures))
         }

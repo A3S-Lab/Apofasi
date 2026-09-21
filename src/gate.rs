@@ -46,16 +46,22 @@ impl Default for GatePolicy {
 }
 
 /// Gate one typed answer.
+///
+/// Non-finite values and probabilities outside `[0, 1]` escalate. A host must
+/// not automate on a signal that is not a probability.
 pub fn gate_answer(answer: &Answer, policy: &GatePolicy) -> GateAction {
     match answer {
         Answer::Choice { confidence, .. } | Answer::Score { confidence, .. } => {
-            if *confidence >= policy.min_confidence {
+            if unit_interval(*confidence) && *confidence >= policy.min_confidence {
                 GateAction::Auto
             } else {
                 GateAction::Escalate
             }
         }
         Answer::Noul { noul } => {
+            if !unit_interval(*noul) {
+                return GateAction::Escalate;
+            }
             let extremity = (*noul).max(1.0 - *noul);
             if extremity >= policy.min_noul_extremity {
                 GateAction::Auto
@@ -64,6 +70,10 @@ pub fn gate_answer(answer: &Answer, policy: &GatePolicy) -> GateAction {
             }
         }
     }
+}
+
+fn unit_interval(value: f32) -> bool {
+    value.is_finite() && (0.0..=1.0).contains(&value)
 }
 
 /// Gate every answer in a response (question id → action).
@@ -136,6 +146,37 @@ mod tests {
             gate_answer(&answer, &GatePolicy::default()),
             GateAction::Escalate
         );
+    }
+
+    #[test]
+    fn non_probability_signals_escalate() {
+        let policy = GatePolicy::default();
+        for confidence in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -0.1, 1.1] {
+            let answer = Answer::Choice {
+                choice: "billing".into(),
+                confidence,
+                probabilities: Default::default(),
+            };
+            assert_eq!(
+                gate_answer(&answer, &policy),
+                GateAction::Escalate,
+                "confidence={confidence}"
+            );
+            let answer = Answer::Score {
+                score: 1.0,
+                confidence,
+                legend: Default::default(),
+                probabilities: Default::default(),
+            };
+            assert_eq!(gate_answer(&answer, &policy), GateAction::Escalate);
+        }
+        for noul in [f32::NAN, f32::INFINITY, -0.2, 1.4] {
+            assert_eq!(
+                gate_answer(&Answer::Noul { noul }, &policy),
+                GateAction::Escalate,
+                "noul={noul}"
+            );
+        }
     }
 
     #[test]

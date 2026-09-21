@@ -277,7 +277,7 @@ pub struct SystemOneRequest {
 pub struct TokenUsage {
     /// Input tokens.
     pub input_tokens: u32,
-    /// Output tokens (reported; System One does not generate text).
+    /// Output tokens. Decision engines report `0`; this crate does not generate text.
     pub output_tokens: u32,
 }
 

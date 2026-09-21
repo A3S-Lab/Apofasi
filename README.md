@@ -59,13 +59,23 @@ fn main() -> a3s_apofasi::Result<()> {
 `Client::default` is the lexical engine: pure Rust, no weights. Enable
 `infer` for the neural checkpoint. On Apple Silicon, `metal` and `mlx`
 select the GPU path; `mlx` is the fast path and links a prebuilt
-`libmlx` via `MLX_ROOT`.
+`libmlx` via `MLX_ROOT`. On NVIDIA hosts use `cuda`. For warm CPU
+latency, enable `ort` and place `encoder.onnx` (or `encoder.opt.onnx`)
+next to the checkpoint — see `scripts/ort_encoder_probe.py`. Optional
+`mkl` helps the Candle head; Windows also needs `libiomp5md.dll` next to
+the binary.
 
 ```bash
 cargo build --release
 cargo build --release --features cli,metal,mlx --bin a3s-apofasi
+cargo build --release --features cli,cuda,mkl,ort --bin a3s-apofasi
 ```
 
+CUDA loads `bf16` when the checkpoint `amp_dtype` says so (override with
+`APOFASI_DTYPE`). Warm triage on an RTX 4090 is ~22–28 ms p50. CPU ORT
+warm triage is ≤ 500 ms when the ONNX encoder is present. Set
+`APOFASI_PROFILE=1` to split `pack_ms` / `fwd_ms`. See
+[`ARCHITECTURE.md`](ARCHITECTURE.md) for targets and evidence.
 ## Versus Jev
 
 Apofasi 0.1.1 was measured on Apple Silicon with the MLX forward path.

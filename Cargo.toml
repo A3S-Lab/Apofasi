@@ -23,6 +23,10 @@ metal = ["infer", "candle-core/metal", "candle-nn/metal"]
 # Apple MLX decision forward (links a prebuilt libmlx; see build.rs).
 mlx = ["infer"]
 cuda = ["infer", "candle-core/cuda", "candle-nn/cuda"]
+# Optional Intel MKL for CPU matmul (closes the warm CPU latency target when present).
+mkl = ["infer", "candle-core/mkl", "candle-nn/mkl"]
+# ONNX Runtime ModernBERT encoder on CPU (Scale 3). Requires `encoder.onnx` beside the checkpoint.
+ort = ["infer", "dep:ort"]
 # RLCD train helpers + publish layout (pulls infer for checkpoint IO).
 train = ["infer"]
 # CLI binary `a3s-apofasi` (smoke / bench).
@@ -36,6 +40,7 @@ thiserror = "2"
 candle-core = { version = "0.9.1", optional = true }
 candle-nn = { version = "0.9.1", optional = true }
 tokenizers = { version = "0.21", optional = true }
+ort = { version = "2.0.0-rc.9", optional = true }
 
 [build-dependencies]
 cc = "1"

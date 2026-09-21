@@ -1,0 +1,30 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: default
+            flags: ""
+          - name: infer
+            flags: "--features infer"
+    name: ${{ matrix.name }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: fmt
+        if: matrix.name == 'default'
+        run: cargo fmt --all -- --check
+      - name: clippy
+        run: cargo clippy --all-targets ${{ matrix.flags }} -- -D warnings
+      - name: test
+        run: cargo test --all-targets ${{ matrix.flags }}

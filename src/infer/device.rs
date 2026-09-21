@@ -1,6 +1,6 @@
 //! Device selection for neural inference.
 
-use candle_core::Device;
+use candle_core::{DType, Device};
 
 use crate::error::{Error, Result};
 
@@ -59,5 +59,35 @@ fn new_cuda() -> Result<Device> {
         Err(Error::Infer(
             "cuda requested but crate built without `cuda` feature".into(),
         ))
+    }
+}
+
+/// Resolve weight / activation dtype for Candle loads.
+///
+/// CUDA may run `bf16`/`fp16` when the checkpoint (or `APOFASI_DTYPE`) asks for
+/// it. CPU and Metal stay on `f32` so logits stay aligned with the MLX f32 path
+/// and so host CPUs without fast half matmul do not regress.
+pub fn weight_dtype(device: &Device, amp_dtype: &str) -> DType {
+    let requested = std::env::var("APOFASI_DTYPE")
+        .unwrap_or_else(|_| amp_dtype.to_string())
+        .to_ascii_lowercase();
+    if device.is_cuda() {
+        match requested.as_str() {
+            "bf16" | "bfloat16" => DType::BF16,
+            "fp16" | "f16" | "half" => DType::F16,
+            _ => DType::F32,
+        }
+    } else {
+        DType::F32
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cpu_weight_dtype_stays_f32_even_when_amp_is_bf16() {
+        assert_eq!(weight_dtype(&Device::Cpu, "bf16"), DType::F32);
     }
 }

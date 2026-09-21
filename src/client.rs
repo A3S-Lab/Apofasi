@@ -113,5 +113,6 @@ mod tests {
         assert!(v["answers"]["department"]["choice"].is_string());
         assert!(v["answers"]["department"]["confidence"].is_number());
         assert!(v["usage"]["input_tokens"].as_u64().unwrap() > 0);
+        assert_eq!(v["usage"]["output_tokens"], 0);
     }
 }

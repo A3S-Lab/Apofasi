@@ -5,6 +5,7 @@
 //! checkpoint's calibrated option-count buckets. A later pass compares the
 //! group winners. Questions that already fit are one group and are unchanged.
 
+use crate::error::{Error, Result};
 use crate::sequence::HEAD_INSTRUCTION_RESERVE;
 
 /// Largest group that still uses a calibrated choice temperature bucket.
@@ -48,36 +49,69 @@ pub fn plan_choice_groups(costs: &[usize], head_max_len: usize) -> Vec<Vec<usize
 /// `groups` indexes the original options. `chunk_probs[g][j]` is the
 /// probability of local option `j` inside group `g`. `winner_probs[g]` is the
 /// probability that group `g`'s winner survives the comparison among winners.
-/// The result is aligned with the original option order and sums to 1.
+/// Every original option must appear once. The result is aligned with that
+/// order and sums to 1. A short chunk, a duplicate index, or a missing option
+/// is an error: those cases used to leave holes and renormalize the rest.
 pub fn compose_grouped_probs(
     option_count: usize,
     groups: &[Vec<usize>],
     chunk_probs: &[Vec<f32>],
     winner_probs: &[f32],
-) -> Vec<f32> {
+) -> Result<Vec<f32>> {
+    if groups.len() != chunk_probs.len() || groups.len() != winner_probs.len() {
+        return Err(Error::InvalidQuestion {
+            id: String::new(),
+            reason: "grouped choice probabilities do not cover every group".into(),
+        });
+    }
     let mut out = vec![0.0f32; option_count];
+    let mut seen = vec![false; option_count];
     for (group, (chunk, &p_group)) in groups
         .iter()
         .zip(chunk_probs.iter().zip(winner_probs.iter()))
     {
-        if group.is_empty() || chunk.is_empty() {
-            continue;
+        if group.is_empty() || chunk.len() != group.len() || !p_group.is_finite() {
+            return Err(Error::InvalidQuestion {
+                id: String::new(),
+                reason: "grouped choice chunk does not match its options".into(),
+            });
+        }
+        if chunk.iter().any(|p| !p.is_finite()) {
+            return Err(Error::InvalidQuestion {
+                id: String::new(),
+                reason: "grouped choice probabilities must be finite".into(),
+            });
         }
         let win = argmax(chunk);
         let p_win = chunk[win].max(1e-12);
         for (local, &index) in group.iter().enumerate() {
-            if index < out.len() && local < chunk.len() {
-                out[index] = chunk[local] / p_win * p_group;
+            if index >= option_count || seen[index] {
+                return Err(Error::InvalidQuestion {
+                    id: String::new(),
+                    reason: format!("grouped choice index {index} is missing or repeated"),
+                });
             }
+            seen[index] = true;
+            out[index] = chunk[local] / p_win * p_group;
         }
+    }
+    if seen.iter().any(|present| !present) {
+        return Err(Error::InvalidQuestion {
+            id: String::new(),
+            reason: "grouped choice did not assign every option".into(),
+        });
     }
     let sum: f32 = out.iter().sum();
-    if sum > 0.0 {
-        for p in &mut out {
-            *p /= sum;
-        }
+    if !sum.is_finite() || sum <= 0.0 {
+        return Err(Error::InvalidQuestion {
+            id: String::new(),
+            reason: "grouped choice probabilities do not form a distribution".into(),
+        });
     }
-    out
+    for p in &mut out {
+        *p /= sum;
+    }
+    Ok(out)
 }
 
 fn argmax(values: &[f32]) -> usize {
@@ -123,7 +157,7 @@ mod tests {
         let groups = vec![vec![0, 1], vec![2, 3]];
         let chunk_probs = vec![vec![0.2, 0.8], vec![0.7, 0.3]];
         let winner_probs = vec![0.25, 0.75];
-        let probs = compose_grouped_probs(4, &groups, &chunk_probs, &winner_probs);
+        let probs = compose_grouped_probs(4, &groups, &chunk_probs, &winner_probs).unwrap();
         let sum: f32 = probs.iter().sum();
         assert!((sum - 1.0).abs() < 1e-5, "sum={sum}");
         let best = probs
@@ -135,5 +169,15 @@ mod tests {
         assert_eq!(best, 2);
         assert!(probs[3] < probs[2]);
         assert!(probs[1] < probs[2]);
+    }
+
+    #[test]
+    fn short_chunk_does_not_renormalize_the_rest() {
+        let groups = vec![vec![0, 1], vec![2, 3]];
+        let chunk_probs = vec![vec![0.2, 0.8], vec![1.0]];
+        let winner_probs = vec![0.25, 0.75];
+        let err = compose_grouped_probs(4, &groups, &chunk_probs, &winner_probs)
+            .expect_err("a short chunk must not drop an option");
+        assert!(err.to_string().contains("does not match"));
     }
 }

@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use crate::engine::DecisionEngine;
 use crate::error::Result;
-use crate::route::CheckpointId;
+use crate::route::{CheckpointId, RouteDecision};
 use crate::router::Router;
 use crate::schema::{SystemOneRequest, SystemOneResponse};
 
@@ -73,14 +73,7 @@ impl CheckpointRegistry {
     /// when each directory is present.
     pub fn preload(&mut self, names: &[CheckpointId]) -> Result<()> {
         let targets: Vec<CheckpointId> = if names.is_empty() {
-            [
-                CheckpointId::English,
-                CheckpointId::Multilingual,
-                CheckpointId::TypedDecisions,
-            ]
-            .into_iter()
-            .filter(|id| CheckpointPaths::resolve_named(&self.bundle, *id).is_ok())
-            .collect()
+            CheckpointPaths::present_in_bundle(&self.bundle)
         } else {
             names.to_vec()
         };
@@ -113,6 +106,11 @@ impl CheckpointRegistry {
         Ok(self.engines.get(&id).expect("just inserted"))
     }
 
+    /// Borrow a resident engine. Empty when `id` is not loaded.
+    pub fn get(&self, id: CheckpointId) -> Option<&NeuralEngine> {
+        self.engines.get(&id)
+    }
+
     /// Route then decide with the selected resident engine.
     pub fn system_one(&mut self, request: SystemOneRequest) -> Result<SystemOneResponse> {
         let decision = self.router.route(&request, None, None)?;
@@ -120,17 +118,21 @@ impl CheckpointRegistry {
         engine.decide(&request)
     }
 
-    /// Route then decide, returning the selected checkpoint id.
+    /// Route then decide, returning the selection and the typed answers.
+    ///
+    /// The [`RouteDecision`] is the audit record: which checkpoint ran and why.
+    /// A missing checkpoint fails closed. The engine does not fall back to a
+    /// different pack.
     pub fn system_one_routed(
         &mut self,
         request: SystemOneRequest,
         model: Option<&str>,
         lang: Option<&str>,
-    ) -> Result<(CheckpointId, SystemOneResponse)> {
+    ) -> Result<(RouteDecision, SystemOneResponse)> {
         let decision = self.router.route(&request, model, lang)?;
         let engine = self.load(decision.model)?;
         let response = engine.decide(&request)?;
-        Ok((decision.model, response))
+        Ok((decision, response))
     }
 
     fn touch(&mut self, id: CheckpointId) {
