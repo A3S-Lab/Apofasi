@@ -1,5 +1,7 @@
 # Apofasi
 
+**Language / 语言:** [English](README.md) · [中文](README.zh-CN.md)
+
 Typed decisions in one forward pass. No generation, nothing to parse.
 
 *Apófasi* (απόφαση) means **decision**. A host gives Apofasi a state and a
