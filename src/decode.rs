@@ -108,6 +108,7 @@ fn round4(v: f32) -> f32 {
     (v * 10_000.0).round() / 10_000.0
 }
 
+#[cfg(feature = "infer")]
 pub(crate) fn choice_from_probs(option_labels: &[String], probs: &[f32]) -> Result<Answer> {
     if option_labels.len() != probs.len() || option_labels.is_empty() {
         return Err(Error::InvalidQuestion {

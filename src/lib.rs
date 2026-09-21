@@ -57,6 +57,7 @@ pub mod reward;
 pub mod route;
 pub mod schema;
 pub mod sequence;
+#[cfg(any(test, feature = "infer"))]
 mod wide_choice;
 
 #[cfg(feature = "router")]
