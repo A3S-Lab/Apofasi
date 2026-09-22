@@ -19,8 +19,23 @@ use crate::engine::DecisionEngine;
 use crate::error::{Error, Result};
 use crate::primitive::DecisionKind;
 use crate::schema::{Criteria, Question, State, SystemOneRequest, SystemOneResponse, TokenUsage};
-use crate::sequence::{choice_option_costs, pack_question, PackedQuestion};
-use crate::wide_choice::{compose_grouped_probs, plan_choice_groups};
+use crate::sequence::{
+    choice_option_costs, pack_question, pack_question_with_state_ids, PackedQuestion, Tokenize,
+};
+use crate::wide_choice::{
+    compose_survivor_probs, plan_choice_groups, redistribute_top_probs, refine_leader_count,
+    survivor_locals, top_probability_indexes, REFINE_TOP_K,
+};
+
+fn attach_question(question_id: &str, err: Error) -> Error {
+    match err {
+        Error::InvalidQuestion { reason, .. } => Error::InvalidQuestion {
+            id: question_id.to_string(),
+            reason,
+        },
+        other => other,
+    }
+}
 
 enum EngineNet {
     Candle(DecisionNet),
@@ -202,7 +217,8 @@ impl NeuralEngine {
             .config
             .temperatures
             .resolve(question.type_, labels.len());
-        Ok((labels, softmax(logits, temp), tokens))
+        let probs = softmax(logits, temp).map_err(|err| attach_question(question_id, err))?;
+        Ok((labels, probs, tokens))
     }
 
     fn choice_distribution(
@@ -237,19 +253,52 @@ impl NeuralEngine {
             return self.direct_distribution(state, question_id, question);
         }
 
+        let state_text = state.model_text()?.replace(&self.tokenizer.mask_token, " ");
+        let state_ids = self.tokenizer.encode_ordinary(&state_text)?;
+
+        let (mut composed, mut tokens) = self.tournament_compose(
+            state,
+            question_id,
+            question,
+            &labels,
+            &groups,
+            &state_ids,
+            depth,
+        )?;
+
+        if depth == 0 {
+            let (refined, refine_tokens) =
+                self.refine_top_choice(state, question_id, question, &composed)?;
+            tokens = tokens.saturating_add(refine_tokens);
+            composed = refined;
+        }
+        Ok((labels, composed, tokens))
+    }
+
+    /// One interleaved tournament: score each group, continue survivors, compose.
+    fn tournament_compose(
+        &self,
+        state: &State,
+        question_id: &str,
+        question: &Question,
+        labels: &[String],
+        groups: &[Vec<usize>],
+        state_ids: &[u32],
+        depth: usize,
+    ) -> Result<(Vec<f32>, u32)> {
         let mut jobs: Vec<Option<PackedQuestion>> = Vec::with_capacity(groups.len());
         let mut tokens = 0u32;
-        for group in &groups {
+        for group in groups {
             if group.len() < 2 {
                 jobs.push(None);
                 continue;
             }
             let subset = subset_choice(question, group)?;
-            let packed = pack_question(
+            let packed = pack_question_with_state_ids(
                 &self.tokenizer,
                 self.tokenizer.specials,
                 &self.tokenizer.mask_token,
-                state,
+                state_ids,
                 question_id,
                 &subset,
                 self.config.sequence,
@@ -272,7 +321,8 @@ impl NeuralEngine {
         }
         let mut output_at = 0usize;
         let mut chunk_probs = Vec::with_capacity(groups.len());
-        let mut winner_keys = Vec::with_capacity(groups.len());
+        let mut survivor_local = Vec::with_capacity(groups.len());
+        let mut survivor_keys = Vec::new();
         for (group, job) in groups.iter().zip(&jobs) {
             let probs = if job.is_none() {
                 vec![1.0]
@@ -290,36 +340,88 @@ impl NeuralEngine {
                     .config
                     .temperatures
                     .resolve(DecisionKind::Choice, logits.len());
-                softmax(logits, temp)
+                softmax(logits, temp).map_err(|err| attach_question(question_id, err))?
             };
-            let win = probs
-                .iter()
-                .enumerate()
-                .max_by(|a, b| a.1.total_cmp(b.1))
-                .map(|(i, _)| i)
-                .unwrap_or(0);
-            winner_keys.push(labels[group[win]].clone());
+            let locals = survivor_locals(&probs);
+            for &local in &locals {
+                survivor_keys.push(labels[group[local]].clone());
+            }
+            survivor_local.push(locals);
             chunk_probs.push(probs);
         }
 
-        let winner_probs = if winner_keys.len() == 1 {
+        let survivor_probs = if survivor_keys.len() == 1 {
             vec![1.0]
         } else {
-            let winners = subset_choice_keys(question, &winner_keys)?;
-            let (_labels, probs, winner_tokens) =
-                self.choice_distribution(state, question_id, &winners, depth + 1)?;
-            tokens = tokens.saturating_add(winner_tokens);
+            let survivors = subset_choice_keys(question, &survivor_keys)?;
+            let (_labels, probs, survivor_tokens) =
+                self.choice_distribution(state, question_id, &survivors, depth + 1)?;
+            tokens = tokens.saturating_add(survivor_tokens);
+            if probs.len() != survivor_keys.len() {
+                return Err(Error::Infer(format!(
+                    "question `{question_id}` survivor comparison returned {} probabilities for {} options",
+                    probs.len(),
+                    survivor_keys.len()
+                )));
+            }
             probs
         };
-        let composed = compose_grouped_probs(labels.len(), &groups, &chunk_probs, &winner_probs)
-            .map_err(|err| match err {
-                Error::InvalidQuestion { reason, .. } => Error::InvalidQuestion {
-                    id: question_id.to_string(),
-                    reason,
-                },
-                other => other,
-            })?;
-        Ok((labels, composed, tokens))
+        let composed = compose_survivor_probs(
+            labels.len(),
+            groups,
+            &chunk_probs,
+            &survivor_local,
+            &survivor_probs,
+        )
+        .map_err(|err| match err {
+            Error::InvalidQuestion { reason, .. } => Error::InvalidQuestion {
+                id: question_id.to_string(),
+                reason,
+            },
+            other => other,
+        })?;
+        Ok((composed, tokens))
+    }
+
+    /// Joint forward over the close composed leaders after a tournament.
+    ///
+    /// Skipped when the composed leader already has a clear margin. When the
+    /// race is close, only the near contenders are compared: a fresh forward
+    /// over eight candidates can reintroduce distractors and shuffle a winner
+    /// that a pairwise (or triple) joint score would keep.
+    fn refine_top_choice(
+        &self,
+        state: &State,
+        question_id: &str,
+        question: &Question,
+        composed: &[f32],
+    ) -> Result<(Vec<f32>, u32)> {
+        if composed.len() <= 2 {
+            return Ok((composed.to_vec(), 0));
+        }
+        let ranked = top_probability_indexes(composed, REFINE_TOP_K);
+        let keep = refine_leader_count(composed, &ranked);
+        if keep < 2 {
+            return Ok((composed.to_vec(), 0));
+        }
+        let top = &ranked[..keep];
+        let subset = subset_choice(question, top)?;
+        let (_labels, fresh, tokens) = self.direct_distribution(state, question_id, &subset)?;
+        if fresh.len() != top.len() {
+            return Err(Error::Infer(format!(
+                "question `{question_id}` top-choice refine returned {} probabilities for {} options",
+                fresh.len(),
+                top.len()
+            )));
+        }
+        let refined = redistribute_top_probs(composed, top, &fresh).map_err(|err| match err {
+            Error::InvalidQuestion { reason, .. } => Error::InvalidQuestion {
+                id: question_id.to_string(),
+                reason,
+            },
+            other => other,
+        })?;
+        Ok((refined, tokens))
     }
 }
 

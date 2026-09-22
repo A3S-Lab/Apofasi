@@ -71,6 +71,8 @@ gate for first neural smoke.
 - [x] Fixed case `bench --case wide` and `APOFASI_PROFILE` timings for grouped forwards
 - [x] Pilot-v1 Banking77, 100 examples, seed `20260917+2`: accuracy 0.56 (published 0.560), CUDA BF16 p50 74.16 ms
 - [x] Groups already fill `head_max_len` (8 sequences, batch seq 235, then one winner forward). One unshortened forward does not fit `max_len`. Option shortening, skipped groups, and a CUDA port of Metal-only Candle SDPA were not taken
+- [x] Group size follows the head budget, so a group of 11 or more uses the checkpoint `choice:11+` temperature instead of a fixed cap of 10
+- [x] Unmodified [jev-benchmarks](https://github.com/AbdelStark/jev-benchmarks) `configs/pilot-v1.yaml`: seed `20260917`, 100 examples each of AG News, Banking77, and DAIR Emotion, scored by that package's `group_scores` (10 ECE bins, 5% error budget). CUDA BF16 english, 300 rows, 0 failures: AG News accuracy 0.970 (p50 21.4 ms), Banking77 0.710 (p50 143.1 ms), DAIR Emotion 0.430 (p50 22.4 ms). Groups are interleaved; crowded groups advance a runner-up and a close third place; when composed leaders are close, only the near contenders (top 2, or top 3 if third is still close) get one joint refine forward; state tokenization is shared across packs; colon-template hypothesis boilerplate is stripped before packing (DAIR) while non-colon openers stay intact. Earlier winner-only on this seed was Banking77 0.560; runner-up-only 0.610; interleaved without refine 0.650; conditional top-8 refine 0.670; close-set refine without prefix strip was DAIR 0.420
 
 ## Enterprise GA
 
@@ -92,5 +94,8 @@ are not GA work.
 - [x] Decode rejects non-finite logits and probabilities instead of emitting an answer
 - [x] Wide-choice composition errors when a group does not cover its options, instead of renormalizing the labels that remain
 - [x] Entropy confidence is 0 unless the vector is a probability distribution, so an all-zero vector cannot pass a host gate
+- [x] Blank instructions and blank choice keys are rejected. A gate policy threshold outside `[0, 1]` escalates instead of auto-approving every finite signal
+- [x] Published choice and score probabilities stay a distribution at 0.0001 resolution, and the chosen label stays an argmax
+- [x] Softmax rejects a non-finite or non-positive temperature instead of clamping it to a tiny floor that makes every answer look certain
 - [ ] GitHub CI green on that workflow (local tests are not a substitute for the hosted run)
 - [ ] Crate consumed by an A3S host (Desktop / Code / CLI) through the documented `crates/apofasi` submodule

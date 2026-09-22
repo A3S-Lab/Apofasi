@@ -76,21 +76,43 @@ pub fn render_options(question: &Question) -> Result<Vec<(String, String)>> {
                     reason: "choice criteria missing".into(),
                 });
             };
+            let descriptions: Vec<Option<String>> = opts
+                .values()
+                .map(|value| match value {
+                    None => None,
+                    Some(desc) => {
+                        let rendered = criterion_text(desc);
+                        if rendered.is_empty() {
+                            None
+                        } else {
+                            Some(rendered)
+                        }
+                    }
+                })
+                .collect();
+            let shared = shared_choice_description_prefix(
+                descriptions.iter().filter_map(|value| value.as_deref()),
+            );
             Ok(opts
-                .iter()
-                .map(|(k, v)| {
-                    let text = match v {
-                        None => k.clone(),
-                        Some(desc) => {
-                            let rendered = criterion_text(desc);
-                            if rendered.is_empty() {
-                                k.clone()
+                .keys()
+                .zip(descriptions)
+                .map(|(key, description)| {
+                    let text = match description {
+                        None => key.clone(),
+                        Some(rendered) => {
+                            let body = if shared.is_empty() {
+                                rendered
                             } else {
-                                format!("{k}: {rendered}")
+                                rendered[shared.len()..].to_string()
+                            };
+                            if body.is_empty() {
+                                key.clone()
+                            } else {
+                                format!("{key}: {body}")
                             }
                         }
                     };
-                    (k.clone(), text)
+                    (key.clone(), text)
                 })
                 .collect())
         }
@@ -142,6 +164,51 @@ pub fn render_options(question: &Question) -> Result<Vec<(String, String)>> {
     }
 }
 
+/// Drop boilerplate shared by every choice description.
+///
+/// Jev-style hypotheses often repeat a long template ("This example tweet
+/// expresses the emotion: …"). Keeping that template next to every `[MASK]`
+/// wastes head budget and dilutes the distinctive label. Only strip when the
+/// shared span is long enough and every option still has a non-empty remainder.
+fn shared_choice_description_prefix<'a>(descriptions: impl IntoIterator<Item = &'a str>) -> String {
+    let mut iter = descriptions.into_iter();
+    let Some(first) = iter.next() else {
+        return String::new();
+    };
+    let mut prefix = first;
+    for description in iter {
+        while !description.starts_with(prefix) {
+            if prefix.is_empty() {
+                return String::new();
+            }
+            prefix = &prefix[..prefix.len() - 1];
+        }
+    }
+    if prefix.chars().count() < 16 {
+        return String::new();
+    }
+    // Prefer cutting on a whitespace / punctuation boundary so "emotion: anger"
+    // does not become "otion: anger".
+    let boundary = prefix
+        .char_indices()
+        .rev()
+        .find(|&(_, ch)| ch.is_whitespace() || matches!(ch, ':' | '-' | '/' | ','))
+        .map(|(index, ch)| index + ch.len_utf8())
+        .unwrap_or(prefix.len());
+    let prefix = &prefix[..boundary];
+    if prefix.chars().count() < 16 {
+        return String::new();
+    }
+    // Only strip rubric templates that introduce the label after a colon
+    // ("… emotion: anger"). Bare shared openers like "This example news text
+    // is about " are part of the checkpoint's training distribution for AG
+    // News / Banking77 and must stay intact.
+    if !prefix.contains(':') {
+        return String::new();
+    }
+    prefix.to_string()
+}
+
 /// Pack one question + state into the canonical token layout.
 ///
 /// `mask_token_str` is stripped from instructions/options/state (replaced with
@@ -151,6 +218,30 @@ pub fn pack_question<T: Tokenize>(
     specials: SpecialTokens,
     mask_token_str: &str,
     state: &State,
+    question_id: &str,
+    question: &Question,
+    cfg: SequenceConfig,
+) -> Result<PackedQuestion> {
+    let state_text = state.model_text()?.replace(mask_token_str, " ");
+    let state_ids = tok.encode_ordinary(&state_text)?;
+    pack_question_with_state_ids(
+        tok,
+        specials,
+        mask_token_str,
+        &state_ids,
+        question_id,
+        question,
+        cfg,
+    )
+}
+
+/// Pack using a pre-encoded state. Wide choice reuses one state encode across
+/// every group forward; encoder hidden states are still never shared.
+pub fn pack_question_with_state_ids<T: Tokenize>(
+    tok: &T,
+    specials: SpecialTokens,
+    mask_token_str: &str,
+    state_ids: &[u32],
     question_id: &str,
     question: &Question,
     cfg: SequenceConfig,
@@ -228,12 +319,8 @@ pub fn pack_question<T: Tokenize>(
     }
 
     let room = cfg.max_len.saturating_sub(ids.len().saturating_add(1));
-    let state_text = state.model_text()?.replace(mask_token_str, " ");
-    let mut state_ids = tok.encode_ordinary(&state_text)?;
-    if state_ids.len() > room {
-        state_ids.truncate(room);
-    }
-    ids.extend(state_ids);
+    let take = room.min(state_ids.len());
+    ids.extend_from_slice(&state_ids[..take]);
     ids.push(specials.sep);
 
     if ids.len() > cfg.max_len {
@@ -362,6 +449,56 @@ mod tests {
         let opts = render_options(&q).unwrap();
         assert_eq!(opts[0].1, "level 0: low");
         assert_eq!(opts[1].1, "level 1: high");
+    }
+
+    #[test]
+    fn choice_strips_shared_hypothesis_boilerplate() {
+        let mut opts = IndexMap::new();
+        opts.insert(
+            "label_000".into(),
+            Some(json!("This example tweet expresses the emotion: anger")),
+        );
+        opts.insert(
+            "label_001".into(),
+            Some(json!("This example tweet expresses the emotion: fear")),
+        );
+        let q = Question::new(
+            DecisionKind::Choice,
+            json!("Which?"),
+            Some(Criteria::Choice(opts)),
+        )
+        .unwrap();
+        let rendered = render_options(&q).unwrap();
+        assert_eq!(rendered[0].1, "label_000: anger");
+        assert_eq!(rendered[1].1, "label_001: fear");
+    }
+
+    #[test]
+    fn choice_keeps_shared_openers_without_a_colon_template() {
+        let mut opts = IndexMap::new();
+        opts.insert(
+            "label_000".into(),
+            Some(json!("This example news text is about business news")),
+        );
+        opts.insert(
+            "label_001".into(),
+            Some(json!("This example news text is about sports")),
+        );
+        let q = Question::new(
+            DecisionKind::Choice,
+            json!("Which?"),
+            Some(Criteria::Choice(opts)),
+        )
+        .unwrap();
+        let rendered = render_options(&q).unwrap();
+        assert_eq!(
+            rendered[0].1,
+            "label_000: This example news text is about business news"
+        );
+        assert_eq!(
+            rendered[1].1,
+            "label_001: This example news text is about sports"
+        );
     }
 
     #[test]

@@ -69,6 +69,9 @@ impl Default for TemperatureTable {
 
 impl TemperatureTable {
     /// Resolve temperature for a question.
+    ///
+    /// The configured value is returned unchanged. Callers reject non-finite
+    /// and non-positive temperatures instead of substituting a tiny floor.
     pub fn resolve(&self, kind: DecisionKind, option_count: usize) -> f32 {
         let key = temp_bucket(kind, option_count);
         self.by_options
@@ -76,7 +79,6 @@ impl TemperatureTable {
             .find(|(k, _)| k == &key)
             .map(|(_, v)| *v)
             .unwrap_or(self.by_kind[kind.type_id() as usize])
-            .max(1e-3)
     }
 }
 
@@ -111,5 +113,14 @@ mod tests {
         assert_eq!(temp_bucket(DecisionKind::Choice, 4), "choice:3-5");
         assert_eq!(temp_bucket(DecisionKind::Noul, 2), "noul:2");
         assert_eq!(temp_bucket(DecisionKind::Choice, 20), "choice:11+");
+    }
+
+    #[test]
+    fn resolve_keeps_non_positive_temperature() {
+        let mut table = TemperatureTable::default();
+        table.by_kind[DecisionKind::Choice.type_id() as usize] = 0.0;
+        assert_eq!(table.resolve(DecisionKind::Choice, 4), 0.0);
+        table.by_options.push(("choice:3-5".into(), -1.0));
+        assert_eq!(table.resolve(DecisionKind::Choice, 4), -1.0);
     }
 }

@@ -108,9 +108,11 @@ for Noul, the `noul` probability itself is the signal (near 0 or 1 = confident).
 - State budget: `max_len - head_len - 1`.
 - Markers: absolute token indices of each `[MASK]`.
 - High-cardinality choices that do not fit in `head_max_len` are split into
-  groups that do. Each group is one forward with the full option text, then
-  the group winners are compared the same way. A choice that already fits is
-  still one forward.
+  interleaved groups that do. Each group is one forward with the full option
+  text. Crowded groups also carry a runner-up (and a close third place) into
+  the next comparison. When the composed leaders are close, those leaders get
+  one joint forward. A choice that already fits is still one forward. The same
+  state token ids are reused across group packs; encoder states are not.
 
 ### Network
 
@@ -288,7 +290,8 @@ hosted Jev accuracy and latency. Use `APOFASI_PROFILE=1` to split `pack_ms` /
 | CPU Candle+MKL english-large | ~1.3–1.6 s | ≤ 500 ms FAIL |
 | CPU ORT FP32 multilingual (`encoder.onnx`) | ~230–285 ms | ≤ 500 ms PASS |
 | CPU ORT FP32 english-large (`encoder.opt.onnx`) | 463.95 ms | ≤ 500 ms PASS (exact smoke parity vs CUDA f32) |
-| CUDA BF16 Banking77 (100, pilot-v1 seed) | 74.16 ms | accuracy 0.56, matches published 0.560. Groups fill `head_max_len` |
+| CUDA BF16 Banking77 (100, pilot-v1 seed `20260917`) | 143.1 ms | accuracy 0.710. Interleaved groups; runner-up / close third; close-set joint refine (top 2–3) when leaders are close |
+| CUDA BF16 DAIR Emotion (100, same pilot) | 22.4 ms | accuracy 0.430. Colon-template hypothesis boilerplate stripped before packing |
 | CPU ORT INT8 english-large (`APOFASI_ORT_QUANT=1`) | ~300 ms | faster but **breaks** confidence/gates — not default |
 
 Profile: `pack_ms` ≪ `fwd_ms`. Export ONNX with `scripts/ort_encoder_probe.py`.

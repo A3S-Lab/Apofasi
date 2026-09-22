@@ -58,17 +58,15 @@ cargo build --release --features cli,metal,mlx --bin a3s-apofasi
 
 ## 相对 Jev
 
-Apofasi 0.1.1 在 Apple Silicon 上用 MLX 前向路径测量。Jev **没有**在这台机器上运行。下面的 Jev 数字是已发布的托管 API 结果，包含网络往返。Apofasi 的数字是设备上预热后的时间。速度列是本地时间相对已发布 Jev p50 快了多少倍，不是同一台机器上的配对重测。
-
-准确率来自未修改的 [jev-benchmarks](https://github.com/AbdelStark/jev-benchmarks) `pilot-v1` 清单：AG News、Banking77、DAIR Emotion 各 100 条，没有失败。没有改该仓库，也没有改它的配置。Apofasi 使用的问题文本和 `label_000`… 选项键与该包里 Jev 适配器相同。概率由它的 `group_scores` 计分（ECE 10 箱，5% 错误预算）。检查点权重没有改。
+准确率和延迟来自未修改的 [jev-benchmarks](https://github.com/AbdelStark/jev-benchmarks) `pilot-v1` 清单：seed `20260917`，AG News、Banking77、DAIR Emotion 各 100 条，没有失败。没有改该仓库，也没有改它的配置。Apofasi 使用的问题文本和 `label_000`… 选项键与该包里 Jev 适配器相同。概率由它的 `group_scores` 计分（ECE 10 箱，5% 错误预算）。检查点权重没有改。这次是 RTX 4090 上的 CUDA BF16 `english`。Jev **没有**在这台机器上运行。Jev 的数字是已发布的托管 API 结果，包含网络往返。速度列是本地 p50 相对已发布 Jev p50 快了多少倍。
 
 | 数据集 | Apofasi 准确率 | Jev 准确率 | Apofasi p50 | Jev p50 | 速度 |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| AG News | 0.960 | 0.910 | 9.8 ms | 255.9 ms | 26.1× |
-| DAIR Emotion | 0.420 | 0.480 | 13.1 ms | 236.3 ms | 18.0× |
-| Banking77 | 0.560 | 0.870 | 76.1 ms | 246.4 ms | 3.2× |
+| AG News | 0.970 | 0.910 | 21.4 ms | 255.9 ms | 11.9× |
+| DAIR Emotion | 0.430 | 0.480 | 22.4 ms | 236.3 ms | 10.5× |
+| Banking77 | 0.710 | 0.870 | 143.1 ms | 246.4 ms | 1.7× |
 
-AG News 准确率更高，并且快 26.1 倍。Brier 是 0.098，对 Jev 的 0.146；ECE 是 0.137，对 Jev 的 0.064。DAIR Emotion 准确率低 0.060（Brier 0.976 对 0.846，ECE 0.404 对 0.351），快 18.0 倍。它只有 6 个标签，一次前向就放得下。Banking77 有 72 个标签。一次前向会把每个选项切成同一个 token 前缀（准确率 0.020，62% 的样本把真实标签的概率打成 0）。放不进 `head_max_len` 的选择题现在会拆成若干放得进的组，再比较各组的胜出项。准确率 0.560，Brier 0.599，ECE 0.134，真实标签概率为 0 的比例是 0。这仍比已发布的 Jev 低 0.310，也略低于已发布的 GLiNER2.5（准确率 0.610，p50 295.5 ms）。多次前向使这一行是 3.2 倍，而不是单次前向的倍数。已发布的 GLiNER2.5 在另外两组上的准确率 / p50：AG News 0.700 / 44.9 ms，DAIR Emotion 0.440 / 43.3 ms。
+AG News 准确率更高。Brier 是 0.098，对 Jev 的 0.146；ECE 是 0.147，对 Jev 的 0.064。DAIR Emotion 准确率低 0.050（Brier 0.975 对 0.846，ECE 0.434 对 0.351）。它只有 6 个标签，一次前向就放得下。带冒号模板的共享假设样板（`… emotion: anger`）在打包前会剥掉，让每个 `[MASK]` 紧挨区分性标签；没有冒号模板的开场白（AG News / Banking77）保持原样。Banking77 有 72 个标签。一次前向会把每个选项切成同一个 token 前缀（准确率 0.020，62% 的样本把真实标签的概率打成 0）。放不进 `head_max_len` 的选择题会交错拆成若干保留完整选项文本的组。拥挤的组还会把第二名（以及足够接近的第三名）送进下一轮。合成分布前两名接近时，只对近邻领先项（前 2 名，或第三名仍接近时前 3 名）做一次联合前向，避免干扰项再次引入 IIA 失败。准确率 0.710，Brier 0.493，ECE 0.226，真实标签概率为 0 的比例是 0。这高于已发布的 GLiNER2.5 准确率（0.610，p50 295.5 ms），仍比已发布的 Jev 低 0.160。多次前向使这一行是 1.7 倍，而不是单次前向的倍数。已发布的 GLiNER2.5 在另外两组上的准确率 / p50：AG News 0.700 / 44.9 ms，DAIR Emotion 0.440 / 43.3 ms。
 
 这份试点之外，已发布的 Jev 延迟在 jev-benchmarks 的 4 标签和 6 标签任务上是 236–256 ms p50，在 [decision-model-benchmark](https://github.com/nibzard/decision-model-benchmark) 上是 264–276 ms p50。合在一起，公开的 Jev 单题是 **236–276 ms**。
 

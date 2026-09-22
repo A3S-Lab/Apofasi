@@ -132,6 +132,12 @@ impl Question {
 
     /// Validate criteria against the question type.
     pub fn validate(&self) -> Result<()> {
+        if instructions_text(&self.instructions).trim().is_empty() {
+            return Err(Error::InvalidQuestion {
+                id: String::new(),
+                reason: "instructions must be non-empty".into(),
+            });
+        }
         match self.type_ {
             DecisionKind::Choice => match &self.criteria {
                 Some(Criteria::Choice(opts)) if !opts.is_empty() => {
@@ -139,6 +145,12 @@ impl Question {
                         return Err(Error::InvalidQuestion {
                             id: String::new(),
                             reason: "choice criteria accept at most 255 options".into(),
+                        });
+                    }
+                    if opts.keys().any(|key| key.trim().is_empty()) {
+                        return Err(Error::InvalidQuestion {
+                            id: String::new(),
+                            reason: "choice option keys must be non-empty".into(),
                         });
                     }
                     Ok(())
@@ -415,5 +427,22 @@ mod tests {
         assert!(matches!(obj, State::Object(_)));
         let arr: State = serde_json::from_value(json!(["user: hi", "agent: hello"])).unwrap();
         assert!(matches!(arr, State::Array(_)));
+    }
+
+    #[test]
+    fn blank_instructions_and_option_keys_are_rejected() {
+        let err = Question::new(DecisionKind::Noul, json!("   "), None).unwrap_err();
+        assert!(err.to_string().contains("non-empty"));
+
+        let mut opts = IndexMap::new();
+        opts.insert(" ".into(), None);
+        opts.insert("billing".into(), None);
+        let err = Question::new(
+            DecisionKind::Choice,
+            json!("Which team?"),
+            Some(Criteria::Choice(opts)),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("option keys"));
     }
 }

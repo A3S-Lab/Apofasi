@@ -12,8 +12,6 @@ use candle_nn::{
     Module, VarBuilder,
 };
 use serde::Deserialize;
-
-use core::f32;
 use std::sync::Arc;
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -207,6 +205,15 @@ impl ModernBertLayer {
     }
 }
 
+/// Additive fill for padding and tokens outside the sliding window.
+///
+/// `f32::MIN` and `-inf` are not safe here. In bf16 that fill becomes `-inf`,
+/// a pad query whose window contains only padding has every key masked, and
+/// `softmax(-inf)` is NaN. The next layer then reads a NaN key and the whole
+/// sequence collapses. `-1e4` is already zero after softmax and stays finite
+/// in f16 and bf16. The decision head uses the same fill.
+const ATTENTION_LOGIT_FLOOR: f64 = -1.0e4;
+
 // Global attention mask calculated from padded token inputs
 fn prepare_4d_attention_mask(
     mask: &Tensor,
@@ -225,11 +232,7 @@ fn prepare_4d_attention_mask(
         .expand((bsz, 1, tgt_len, src_len))?;
 
     let inverted_mask = (Tensor::ones_like(&expanded_mask)? - &expanded_mask)?;
-    let min = match dtype {
-        DType::F32 | DType::F16 | DType::BF16 => f32::MIN as f64,
-        _ => f32::MIN as f64,
-    };
-    (inverted_mask * min)?.to_dtype(dtype)
+    (inverted_mask * ATTENTION_LOGIT_FLOOR)?.to_dtype(dtype)
 }
 
 // Attention mask caused by the sliding window
@@ -242,7 +245,7 @@ fn get_local_attention_mask(
         .flat_map(|i| {
             (0..seq_len).map(move |j| {
                 if (j as i32 - i as i32).abs() > max_distance as i32 {
-                    f32::NEG_INFINITY
+                    ATTENTION_LOGIT_FLOOR as f32
                 } else {
                     0.
                 }
@@ -356,8 +359,11 @@ impl ModernBert {
                 .mask_cache
                 .lock()
                 .unwrap_or_else(|err| err.into_inner());
+            // Only a dense mask is a function of shape. A padded batch with the
+            // same shape can hide different tokens; reusing that mask either
+            // drops real positions or lets pad queries poison the forward.
             let hit = guard.as_ref().and_then(|(cb, cl, cones, g, l)| {
-                if *cb == b && *cl == seq_len && *cones == all_ones {
+                if all_ones && *cones && *cb == b && *cl == seq_len {
                     Some((g.clone(), l.clone()))
                 } else {
                     None
@@ -387,8 +393,9 @@ impl ModernBert {
                     let local = global_attention_mask.broadcast_add(&local_attention_mask)?;
                     (global_attention_mask, local)
                 };
-                // Cache on every device: rebuilding masks each call was pure overhead.
-                *guard = Some((b, seq_len, all_ones, global.clone(), local.clone()));
+                if all_ones {
+                    *guard = Some((b, seq_len, all_ones, global.clone(), local.clone()));
+                }
                 (global, local)
             }
         };
@@ -410,5 +417,30 @@ impl ModernBert {
         }
         let xs = xs.apply(&self.final_norm)?;
         Ok(xs)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn padding_mask_stays_finite() {
+        let mask = Tensor::from_vec(vec![1u32, 1, 0, 0], (1, 4), &Device::Cpu).unwrap();
+        let attn = prepare_4d_attention_mask(&mask, DType::F32, None).unwrap();
+        let values = attn.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        assert!(values.iter().all(|value| value.is_finite()));
+        assert!(values.contains(&0.0));
+        assert!(values.contains(&-1.0e4));
+        assert!(!values.iter().any(|value| value.is_infinite()));
+    }
+
+    #[test]
+    fn local_window_mask_stays_finite() {
+        let mask = get_local_attention_mask(6, 1, &Device::Cpu).unwrap();
+        let values = mask.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        assert!(values.iter().all(|value| value.is_finite()));
+        assert!(values.contains(&0.0));
+        assert!(values.contains(&(ATTENTION_LOGIT_FLOOR as f32)));
     }
 }

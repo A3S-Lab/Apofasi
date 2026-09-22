@@ -78,39 +78,42 @@ warm triage is ≤ 500 ms when the ONNX encoder is present. Set
 [`ARCHITECTURE.md`](ARCHITECTURE.md) for targets and evidence.
 ## Versus Jev
 
-Apofasi 0.1.1 was measured on Apple Silicon with the MLX forward path.
-Jev was **not** run on this machine. Jev figures below are the published
-hosted-API numbers, and they include the network hop. Apofasi figures are
-warm on-device time. The speed column is how many times faster that local
-time is than the published Jev p50. It is not a paired replay on one machine.
-
-The accuracy rows are the unmodified
+The accuracy and latency rows are the unmodified
 [jev-benchmarks](https://github.com/AbdelStark/jev-benchmarks) `pilot-v1`
-manifest: 100 examples each of AG News, Banking77, and DAIR Emotion, zero
-failures. The benchmark repository and its config were not edited. Apofasi
-saw the same question text and the same `label_000`… option keys as that
-package's Jev adapter. Probabilities were scored by its `group_scores`
-(10 ECE bins, 5% error budget). Checkpoint weights were not changed.
+manifest: seed `20260917`, 100 examples each of AG News, Banking77, and DAIR
+Emotion, zero failures. The benchmark repository and its config were not
+edited. Apofasi saw the same question text and the same `label_000`… option
+keys as that package's Jev adapter. Probabilities were scored by its
+`group_scores` (10 ECE bins, 5% error budget). Checkpoint weights were not
+changed. This run is CUDA BF16 `english` on an RTX 4090. Jev was **not** run
+on this machine. Jev figures are the published hosted-API numbers, and they
+include the network hop. The speed column is how many times faster the local
+p50 is than the published Jev p50.
 
 | Dataset | Apofasi accuracy | Jev accuracy | Apofasi p50 | Jev p50 | Speed |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| AG News | 0.960 | 0.910 | 9.8 ms | 255.9 ms | 26.1× |
-| DAIR Emotion | 0.420 | 0.480 | 13.1 ms | 236.3 ms | 18.0× |
-| Banking77 | 0.560 | 0.870 | 76.1 ms | 246.4 ms | 3.2× |
+| AG News | 0.970 | 0.910 | 21.4 ms | 255.9 ms | 11.9× |
+| DAIR Emotion | 0.430 | 0.480 | 22.4 ms | 236.3 ms | 10.5× |
+| Banking77 | 0.710 | 0.870 | 143.1 ms | 246.4 ms | 1.7× |
 
-AG News is ahead on accuracy and 26.1× faster. Its Brier is 0.098 against
-Jev's 0.146; its ECE is 0.137 against Jev's 0.064. DAIR Emotion is 0.060
-behind on accuracy (Brier 0.976 vs 0.846, ECE 0.404 vs 0.351) and 18.0×
-faster. Its six labels already fit in one forward. Banking77 has 72 labels.
-One forward used to cut every option down to the same token prefix
-(accuracy 0.020, true-label probability 0 on 62% of examples). Choices that
-do not fit `head_max_len` are now split into groups that do, then the group
-winners are compared. Accuracy is 0.560, Brier 0.599, ECE 0.134, and no true
-label is given probability 0. That is still 0.310 behind published Jev, and
-just behind published GLiNER2.5 (0.610 accuracy, 295.5 ms p50). The extra
-forwards make this row 3.2× rather than a single-pass ratio. Published
-GLiNER2.5 accuracy / p50 on the other two sets: AG News 0.700 / 44.9 ms,
-DAIR Emotion 0.440 / 43.3 ms.
+AG News is ahead on accuracy. Its Brier is 0.098 against Jev's 0.146; its ECE
+is 0.147 against Jev's 0.064. DAIR Emotion is 0.050 behind on accuracy (Brier
+0.975 vs 0.846, ECE 0.434 vs 0.351). Its six labels already fit in one
+forward. Shared colon-template boilerplate in the hypotheses
+(`… emotion: anger`) is stripped before packing so each `[MASK]` sits next to
+the distinctive label; openers without a colon template (AG News / Banking77)
+are left intact. Banking77 has 72 labels. One forward used to cut every option
+down to the same token prefix (accuracy 0.020, true-label probability 0 on 62%
+of examples). Choices that do not fit `head_max_len` are split into interleaved
+groups that keep the full option text. Crowded groups also advance a runner-up
+(and a close third place). When the composed leaders are close, only the near
+contenders (top 2, or top 3 if third is still close) get one joint forward so
+distractors do not reintroduce IIA failures. Accuracy is 0.710, Brier 0.493,
+ECE 0.226, and no true label is given probability 0. That is ahead of published
+GLiNER2.5 accuracy (0.610 at 295.5 ms p50) and still 0.160 behind published
+Jev. The extra forwards make this row 1.7× rather than a single-pass ratio.
+Published GLiNER2.5 accuracy / p50 on the other two sets: AG News 0.700 /
+44.9 ms, DAIR Emotion 0.440 / 43.3 ms.
 
 Published Jev latency outside this pilot is 236–256 ms p50 on 4- and 6-label
 tasks in jev-benchmarks, and 264–276 ms p50 in

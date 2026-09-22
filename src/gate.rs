@@ -47,9 +47,13 @@ impl Default for GatePolicy {
 
 /// Gate one typed answer.
 ///
-/// Non-finite values and probabilities outside `[0, 1]` escalate. A host must
-/// not automate on a signal that is not a probability.
+/// Non-finite values and probabilities outside `[0, 1]` escalate. A policy
+/// threshold outside `[0, 1]` also escalates: a negative minimum would
+/// otherwise mark every finite signal as `auto`.
 pub fn gate_answer(answer: &Answer, policy: &GatePolicy) -> GateAction {
+    if !unit_interval(policy.min_confidence) || !unit_interval(policy.min_noul_extremity) {
+        return GateAction::Escalate;
+    }
     match answer {
         Answer::Choice { confidence, .. } | Answer::Score { confidence, .. } => {
             if unit_interval(*confidence) && *confidence >= policy.min_confidence {
@@ -177,6 +181,28 @@ mod tests {
                 "noul={noul}"
             );
         }
+    }
+
+    #[test]
+    fn policy_outside_unit_interval_escalates() {
+        let answer = Answer::Choice {
+            choice: "billing".into(),
+            confidence: 0.95,
+            probabilities: Default::default(),
+        };
+        let policy = GatePolicy {
+            min_confidence: -1.0,
+            min_noul_extremity: 0.7,
+        };
+        assert_eq!(gate_answer(&answer, &policy), GateAction::Escalate);
+        let policy = GatePolicy {
+            min_confidence: 0.7,
+            min_noul_extremity: f32::NAN,
+        };
+        assert_eq!(
+            gate_answer(&Answer::Noul { noul: 0.99 }, &policy),
+            GateAction::Escalate
+        );
     }
 
     #[test]

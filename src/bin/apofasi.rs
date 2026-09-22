@@ -5,6 +5,9 @@
 #[path = "apofasi/suite.rs"]
 mod suite;
 
+#[path = "apofasi/jev_bench.rs"]
+mod jev_bench;
+
 use std::env;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -46,6 +49,13 @@ fn main() -> ExitCode {
                 ExitCode::from(1)
             }
         },
+        "jev-bench" => match jev_bench::run(&args) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("jev-bench failed: {e}");
+                ExitCode::from(1)
+            }
+        },
         "help" | "--help" | "-h" => {
             print_help();
             ExitCode::SUCCESS
@@ -60,7 +70,7 @@ fn main() -> ExitCode {
 
 fn print_help() {
     eprintln!(
-        "Usage:\n  a3s-apofasi smoke [--lexical] [--json] [--checkpoint DIR] [--device auto|metal|cuda|cpu]\n  a3s-apofasi bench [--checkpoint DIR] [--device auto|metal|cuda|cpu] [--iters N] [--warmup N] [--case smoke|triage|wide]\n  a3s-apofasi suite --cases FILE [--checkpoint DIR] [--device auto|metal|cuda|cpu] [--warmup N] [--iters N]\n"
+        "Usage:\n  a3s-apofasi smoke [--lexical] [--json] [--checkpoint DIR] [--device auto|metal|cuda|cpu]\n  a3s-apofasi bench [--checkpoint DIR] [--device auto|metal|cuda|cpu] [--iters N] [--warmup N] [--case smoke|triage|wide]\n  a3s-apofasi suite --cases FILE [--checkpoint DIR] [--device auto|metal|cuda|cpu] [--warmup N] [--iters N]\n  a3s-apofasi jev-bench --manifest FILE --output FILE [--checkpoint DIR] [--device auto|metal|cuda|cpu] [--model english]\n"
     );
 }
 
