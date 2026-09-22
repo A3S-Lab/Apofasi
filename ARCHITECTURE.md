@@ -62,7 +62,7 @@ Public JSON matches TypeSafe System One / Jev:
 
 ```json
 {
-  "model": "apofasi-0.1.1",
+  "model": "apofasi-0.1.2",
   "state": "string | object | array",
   "questions": {
     "<id>": {
@@ -84,7 +84,7 @@ Public JSON matches TypeSafe System One / Jev:
 
 ```json
 {
-  "model": "apofasi-0.1.1",
+  "model": "apofasi-0.1.2",
   "answers": { "<id>": { "type": "...", "...": "..." } },
   "usage": { "input_tokens": 0, "output_tokens": 0 }
 }
@@ -276,7 +276,7 @@ prebuilt MLX package is available.
 | CPU | ≤ 500 ms p50 | Feature `ort` + `encoder.onnx` (prefer `encoder.opt.onnx`). Candle+MKL alone cannot hit the gate on ModernBERT-large. |
 
 Batching N questions in one forward pass is mandatory for the hot path.
-The 0.1.1 Apple Silicon measurements are in the README, next to the published
+The 0.1.2 Apple Silicon measurements are in the README, next to the published
 hosted Jev accuracy and latency. Use `APOFASI_PROFILE=1` to split `pack_ms` /
 `fwd_ms` on any device.
 

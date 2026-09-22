@@ -343,7 +343,7 @@ mod tests {
     #[test]
     fn request_roundtrips_jev_shape() {
         let raw = json!({
-            "model": "apofasi-0.1.1",
+            "model": "apofasi-0.1.2",
             "state": "Help! My payouts have been failing for 3 days.",
             "questions": {
                 "is_urgent": {
@@ -383,7 +383,7 @@ mod tests {
     #[test]
     fn response_roundtrips_jev_shape() {
         let raw = json!({
-            "model": "apofasi-0.1.1",
+            "model": "apofasi-0.1.2",
             "answers": {
                 "is_urgent": { "type": "noul", "noul": 0.95 },
                 "department": {

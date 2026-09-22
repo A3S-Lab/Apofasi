@@ -76,44 +76,49 @@ CUDA loads `bf16` when the checkpoint `amp_dtype` says so (override with
 warm triage is ≤ 500 ms when the ONNX encoder is present. Set
 `APOFASI_PROFILE=1` to split `pack_ms` / `fwd_ms`. See
 [`ARCHITECTURE.md`](ARCHITECTURE.md) for targets and evidence.
+
 ## Versus Jev
 
-The accuracy and latency rows are the unmodified
+Accuracy and latency below are one run of the unmodified
 [jev-benchmarks](https://github.com/AbdelStark/jev-benchmarks) `pilot-v1`
 manifest: seed `20260917`, 100 examples each of AG News, Banking77, and DAIR
 Emotion, zero failures. The benchmark repository and its config were not
 edited. Apofasi saw the same question text and the same `label_000`… option
 keys as that package's Jev adapter. Probabilities were scored by its
 `group_scores` (10 ECE bins, 5% error budget). Checkpoint weights were not
-changed. This run is CUDA BF16 `english` on an RTX 4090. Jev was **not** run
-on this machine. Jev figures are the published hosted-API numbers, and they
-include the network hop. The speed column is how many times faster the local
-p50 is than the published Jev p50.
+changed.
 
-| Dataset | Apofasi accuracy | Jev accuracy | Apofasi p50 | Jev p50 | Speed |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| AG News | 0.970 | 0.910 | 21.4 ms | 255.9 ms | 11.9× |
-| DAIR Emotion | 0.430 | 0.480 | 22.4 ms | 236.3 ms | 10.5× |
-| Banking77 | 0.710 | 0.870 | 143.1 ms | 246.4 ms | 1.7× |
+The run is release `0.1.2` on an Apple M5 Max: MLX, f32 weights, `english`,
+one model load, then all 300 rows. Jev and GLiNER figures are that package's
+published pilot report. Jev latency includes the hosted API hop. The speed
+column divides the published Jev p50 by the local p50.
 
-AG News is ahead on accuracy. Its Brier is 0.098 against Jev's 0.146; its ECE
-is 0.147 against Jev's 0.064. DAIR Emotion is 0.050 behind on accuracy (Brier
-0.975 vs 0.846, ECE 0.434 vs 0.351). Its six labels already fit in one
-forward. Shared colon-template boilerplate in the hypotheses
+| Dataset | Apofasi accuracy | Jev accuracy | GLiNER accuracy | Apofasi p50 | Apofasi p95 | Jev p50 | Speed |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| AG News | 0.960 | 0.910 | 0.700 | 8.2 ms | 9.7 ms | 255.9 ms | 31.1× |
+| DAIR Emotion | 0.440 | 0.480 | 0.440 | 7.4 ms | 7.9 ms | 236.3 ms | 31.8× |
+| Banking77 | 0.700 | 0.870 | 0.610 | 697.6 ms | 7.10 s | 246.4 ms | 0.35× |
+
+AG News leads on accuracy. Brier is 0.098 and ECE is 0.137; published Jev is
+0.146 and 0.064. Four labels fit in one forward, and the p50 is 8.2 ms.
+
+DAIR Emotion has six labels and also fits in one forward. Accuracy is 0.440,
+level with published GLiNER2.5 and 0.040 behind published Jev. Brier is 0.975
+(Jev 0.846) and ECE is 0.424 (Jev 0.351). Shared colon-template boilerplate
 (`… emotion: anger`) is stripped before packing so each `[MASK]` sits next to
-the distinctive label; openers without a colon template (AG News / Banking77)
-are left intact. Banking77 has 72 labels. One forward used to cut every option
-down to the same token prefix (accuracy 0.020, true-label probability 0 on 62%
-of examples). Choices that do not fit `head_max_len` are split into interleaved
-groups that keep the full option text. Crowded groups also advance a runner-up
-(and a close third place). When the composed leaders are close, only the near
-contenders (top 2, or top 3 if third is still close) get one joint forward so
-distractors do not reintroduce IIA failures. Accuracy is 0.710, Brier 0.493,
-ECE 0.226, and no true label is given probability 0. That is ahead of published
-GLiNER2.5 accuracy (0.610 at 295.5 ms p50) and still 0.160 behind published
-Jev. The extra forwards make this row 1.7× rather than a single-pass ratio.
-Published GLiNER2.5 accuracy / p50 on the other two sets: AG News 0.700 /
-44.9 ms, DAIR Emotion 0.440 / 43.3 ms.
+the distinctive label. Openers without a colon template stay intact. The p50
+is 7.4 ms. Published GLiNER2.5 p50 on these two sets is 44.9 ms and 43.3 ms.
+
+Banking77 has 72 labels. Choices that do not fit `head_max_len` are split into
+interleaved groups that keep the full option text. Crowded groups also advance
+a runner-up and a close third place. When the composed leaders are close, only
+the near contenders (top 2, or top 3 when third is still close) get one joint
+forward. Accuracy is 0.700, Brier is 0.495, ECE is 0.223, and no true label is
+given probability 0. That is 0.090 ahead of published GLiNER2.5 (0.610 at
+295.5 ms p50) and 0.170 behind published Jev. The extra forwards set the
+latency: the fastest rows are about 80 ms, the p50 is 697.6 ms, the p95 is
+7.10 s, and the slowest row is 10.8 s. Published Jev p50 on this set is
+246.4 ms, so the local p50 is 0.35× that figure.
 
 Published Jev latency outside this pilot is 236–256 ms p50 on 4- and 6-label
 tasks in jev-benchmarks, and 264–276 ms p50 in
@@ -222,7 +227,7 @@ See [`docs/publish-layout.md`](docs/publish-layout.md).
 | Item | Value |
 | --- | --- |
 | Package | `a3s-apofasi` |
-| Version | 0.1.1 |
+| Version | 0.1.2 |
 | Repository | [A3S-Lab/Apofasi](https://github.com/A3S-Lab/Apofasi) |
 | License | MIT |
 

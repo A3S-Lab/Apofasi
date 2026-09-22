@@ -58,15 +58,21 @@ cargo build --release --features cli,metal,mlx --bin a3s-apofasi
 
 ## 相对 Jev
 
-准确率和延迟来自未修改的 [jev-benchmarks](https://github.com/AbdelStark/jev-benchmarks) `pilot-v1` 清单：seed `20260917`，AG News、Banking77、DAIR Emotion 各 100 条，没有失败。没有改该仓库，也没有改它的配置。Apofasi 使用的问题文本和 `label_000`… 选项键与该包里 Jev 适配器相同。概率由它的 `group_scores` 计分（ECE 10 箱，5% 错误预算）。检查点权重没有改。这次是 RTX 4090 上的 CUDA BF16 `english`。Jev **没有**在这台机器上运行。Jev 的数字是已发布的托管 API 结果，包含网络往返。速度列是本地 p50 相对已发布 Jev p50 快了多少倍。
+下面的准确率和延迟来自一次未修改的 [jev-benchmarks](https://github.com/AbdelStark/jev-benchmarks) `pilot-v1` 清单：seed `20260917`，AG News、Banking77、DAIR Emotion 各 100 条，没有失败。没有改该仓库，也没有改它的配置。Apofasi 使用的问题文本和 `label_000`… 选项键与该包里 Jev 适配器相同。概率由它的 `group_scores` 计分（ECE 10 箱，5% 错误预算）。检查点权重没有改。
 
-| 数据集 | Apofasi 准确率 | Jev 准确率 | Apofasi p50 | Jev p50 | 速度 |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| AG News | 0.970 | 0.910 | 21.4 ms | 255.9 ms | 11.9× |
-| DAIR Emotion | 0.430 | 0.480 | 22.4 ms | 236.3 ms | 10.5× |
-| Banking77 | 0.710 | 0.870 | 143.1 ms | 246.4 ms | 1.7× |
+这次是 `0.1.2` 的 release 构建，机器是 Apple M5 Max：MLX、f32 权重、`english`，模型只加载一次，然后跑完全部 300 条。Jev 和 GLiNER 的数字来自该包已发布的试点报告。Jev 的延迟包含托管 API 的网络往返。速度列是已发布 Jev p50 除以本地 p50。
 
-AG News 准确率更高。Brier 是 0.098，对 Jev 的 0.146；ECE 是 0.147，对 Jev 的 0.064。DAIR Emotion 准确率低 0.050（Brier 0.975 对 0.846，ECE 0.434 对 0.351）。它只有 6 个标签，一次前向就放得下。带冒号模板的共享假设样板（`… emotion: anger`）在打包前会剥掉，让每个 `[MASK]` 紧挨区分性标签；没有冒号模板的开场白（AG News / Banking77）保持原样。Banking77 有 72 个标签。一次前向会把每个选项切成同一个 token 前缀（准确率 0.020，62% 的样本把真实标签的概率打成 0）。放不进 `head_max_len` 的选择题会交错拆成若干保留完整选项文本的组。拥挤的组还会把第二名（以及足够接近的第三名）送进下一轮。合成分布前两名接近时，只对近邻领先项（前 2 名，或第三名仍接近时前 3 名）做一次联合前向，避免干扰项再次引入 IIA 失败。准确率 0.710，Brier 0.493，ECE 0.226，真实标签概率为 0 的比例是 0。这高于已发布的 GLiNER2.5 准确率（0.610，p50 295.5 ms），仍比已发布的 Jev 低 0.160。多次前向使这一行是 1.7 倍，而不是单次前向的倍数。已发布的 GLiNER2.5 在另外两组上的准确率 / p50：AG News 0.700 / 44.9 ms，DAIR Emotion 0.440 / 43.3 ms。
+| 数据集 | Apofasi 准确率 | Jev 准确率 | GLiNER 准确率 | Apofasi p50 | Apofasi p95 | Jev p50 | 速度 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| AG News | 0.960 | 0.910 | 0.700 | 8.2 ms | 9.7 ms | 255.9 ms | 31.1× |
+| DAIR Emotion | 0.440 | 0.480 | 0.440 | 7.4 ms | 7.9 ms | 236.3 ms | 31.8× |
+| Banking77 | 0.700 | 0.870 | 0.610 | 697.6 ms | 7.10 s | 246.4 ms | 0.35× |
+
+AG News 准确率更高。Brier 是 0.098，ECE 是 0.137；已发布 Jev 是 0.146 和 0.064。4 个标签一次前向就放得下，p50 是 8.2 ms。
+
+DAIR Emotion 有 6 个标签，同样一次前向就放得下。准确率 0.440，与已发布 GLiNER2.5 持平，比已发布 Jev 低 0.040。Brier 是 0.975（Jev 0.846），ECE 是 0.424（Jev 0.351）。带冒号模板的共享样板（`… emotion: anger`）在打包前会剥掉，让每个 `[MASK]` 紧挨区分性标签。没有冒号模板的开场白保持原样。p50 是 7.4 ms。已发布 GLiNER2.5 在这两组上的 p50 是 44.9 ms 和 43.3 ms。
+
+Banking77 有 72 个标签。放不进 `head_max_len` 的选择题会交错拆成若干保留完整选项文本的组。拥挤的组还会把第二名，以及足够接近的第三名，送进下一轮。合成分布的领先项接近时，只对近邻项（前 2 名，第三名仍接近时为前 3 名）做一次联合前向。准确率 0.700，Brier 0.495，ECE 0.223，真实标签概率为 0 的比例是 0。这比已发布 GLiNER2.5 高 0.090（0.610，p50 295.5 ms），比已发布 Jev 低 0.170。额外的前向决定了延迟：最快的行大约 80 ms，p50 是 697.6 ms，p95 是 7.10 s，最慢的一行是 10.8 s。已发布 Jev 在这组上的 p50 是 246.4 ms，本地 p50 是该数字的 0.35 倍。
 
 这份试点之外，已发布的 Jev 延迟在 jev-benchmarks 的 4 标签和 6 标签任务上是 236–256 ms p50，在 [decision-model-benchmark](https://github.com/nibzard/decision-model-benchmark) 上是 264–276 ms p50。合在一起，公开的 Jev 单题是 **236–276 ms**。
 
@@ -138,7 +144,7 @@ checkpoint/
 | 项 | 值 |
 | --- | --- |
 | 包名 | `a3s-apofasi` |
-| 版本 | 0.1.1 |
+| 版本 | 0.1.2 |
 | 仓库 | [A3S-Lab/Apofasi](https://github.com/A3S-Lab/Apofasi) |
 | 许可证 | MIT |
 
